@@ -1,10 +1,38 @@
 {
-  "name": "tauri-app",
+  "name": "zlack",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.1.0",
   "type": "module",
+  "description": "A lightweight Slack desktop client built with Tauri",
+  "author": {
+    "name": "sanguneo",
+    "email": "iam@sanguneo.com",
+    "url": "https://github.com/sanguneo"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanguneo/zlack.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sanguneo/zlack/issues"
+  },
+  "homepage": "https://github.com/sanguneo/zlack",
+  "keywords": [
+    "tauri",
+    "slack",
+    "desktop",
+    "lightweight",
+    "webview",
+    "productivity"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:dist:windows": "powershell -ExecutionPolicy Bypass -File build_dist.ps1",
+    "build:dist:unix": "bash build_dist.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^1"
