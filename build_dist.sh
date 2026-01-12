@@ -2,7 +2,7 @@
 set -e
 
 echo "🚧 Starting Zlack Build (Unix)..."
-npm run tauri build
+npm run tauri build:unix
 
 DIST_DIR="dists"
 mkdir -p "$DIST_DIR"

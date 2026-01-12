@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "🚧 Starting Zlack Build..."
-npm run tauri build
+npm run tauri build:windows
 
 $distDir = "dists"
 if (-not (Test-Path $distDir)) {

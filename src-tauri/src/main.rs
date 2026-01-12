@@ -162,6 +162,13 @@ fn main() {
         tauri::WindowUrl::External("https://app.slack.com/client".parse().unwrap())
       )
       .additional_browser_args("--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding")
+      .user_agent(
+        if cfg!(target_os = "macos") {
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        } else {
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+      )
       .title("Zlack")
       .inner_size(1200.0, 800.0)
       .resizable(true)
