@@ -1,11 +1,7 @@
 
 // Preload script to bridge Slack notifications to Tauri
-// Preload script to bridge Slack notifications to Tauri
-// Preload script to bridge Slack notifications to Tauri
 
 // 1. MOCK Service Workers
-// Instead of deleting it (which crashes Slack code expecting it to exist),
-// we provide a dummy implementation that never returns a real registration.
 if (window.navigator) {
     const dummyServiceWorker = {
         controller: null,
@@ -37,43 +33,73 @@ navigator.permissions.query = (parameters) => {
         });
     }
     return originalQuery.call(navigator.permissions, parameters);
-    return originalQuery.call(navigator.permissions, parameters);
 };
 
-// 2.5 Intercept Console Logs for Notifications
-// 2.5 Intercept Console Logs for Notifications
-// Slack logs specific messages when playing sounds or updating counts.
+
+// 2.5 Intercept Network Requests (Telemetry) for Notification Context
 let lastEventContext = { teamId: 'unknown', channelId: 'unknown' };
 
-function interceptLog(methodName) {
-    const original = console[methodName];
-    console[methodName] = function(...args) {
-        original.apply(console, args); // Passthrough
 
-        try {
-            const msg = args.map(a => String(a)).join(' ');
+function processTelemetryBody(bodyStr) {
+    try {
+        if (!bodyStr || !bodyStr.includes('notification:sent')) return;
+        
+        const data = JSON.parse(bodyStr);
+        if (!data.spans) return;
 
-            // Capture Context: [COUNTS] (T06QMGDHYEP) Updated unread_cnt for D094S2QTP9D: 2
-            // Robust regex: allow "Updated unread_cnt for", "Updated badge counts for", etc.
-            // Look for: [COUNTS] ... (TeamID) ... for (ChannelID)
-            const countsMatch = msg.match(/\[COUNTS\].*?\((T[A-Z0-9]+)\).*?for\s+([A-Z0-9]+)/);
-            if (countsMatch) {
-                lastEventContext.teamId = countsMatch[1];
-                lastEventContext.channelId = countsMatch[2];
+        data.spans.forEach(span => {
+            if (span.name === 'notification:sent' && span.tags) {
+                // Extracted tags
+                let tid = null;
+                let cid = null;
+                
+                span.tags.forEach(tag => {
+                    if (tag.key === 'encoded_team_id') tid = tag.v_str;
+                    if (tag.key === 'encoded_channel_id') cid = tag.v_str;
+                });
+
+                if (tid && cid) {
+                    console.log(`[Zlack] Captured context from network: Team=${tid}, Channel=${cid}`);
+                    lastEventContext.teamId = tid;
+                    lastEventContext.channelId = cid;
+                }
             }
-            
-            // Also capture generic [NOTIFICATIONS] (TeamID)
-            const teamMatch = msg.match(/\[NOTIFICATIONS\]\s+\((T[A-Z0-9]+)\)/);
-            if (teamMatch) {
-                lastEventContext.teamId = teamMatch[1];
-            }
-        } catch (e) {
-            // Safe ignore
-        }
-    };
+        });
+    } catch (e) {
+        // Ignore JSON parse errors or other issues
+    }
 }
 
-['log', 'info', 'debug', 'warn'].forEach(interceptLog);
+// Intercept fetch
+const originalFetch = window.fetch;
+window.fetch = function(input, init) {
+    if (init && init.body) {
+        // Clone body is tricky with streams, but Slack's telemetry is usually string/json
+        if (typeof init.body === 'string') {
+            processTelemetryBody(init.body);
+        }
+    }
+    return originalFetch.apply(this, arguments);
+};
+
+// Intercept navigator.sendBeacon
+const originalSendBeacon = navigator.sendBeacon;
+navigator.sendBeacon = function(url, data) {
+    if (data && typeof data === 'string') {
+        processTelemetryBody(data);
+    }
+    return originalSendBeacon.apply(this, arguments);
+};
+
+// Intercept XMLHttpRequest (just in case they use it for some calls)
+const originalXHRScan = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.send = function(body) {
+    if (body && typeof body === 'string') {
+        processTelemetryBody(body);
+    }
+    return originalXHRScan.apply(this, arguments);
+};
+
 
 // 3. Shim Notification API
 const ZlackNotification = class {
@@ -87,8 +113,7 @@ const ZlackNotification = class {
 
     try {
       if (window.__TAURI__) {
-          // Delay slightly to ensure console logs (which happen around the same time) 
-          // have updated the lastEventContext.
+          // Delay slightly to ensure network/console logs have updated context
           setTimeout(() => {
               const teamId = lastEventContext.teamId || 'unknown';
               const channelId = lastEventContext.channelId || 'unknown';
@@ -100,7 +125,7 @@ const ZlackNotification = class {
                 teamId: teamId,
                 channelId: channelId
               });
-          }, 1000);
+          }, 500); // Wait for network telemetry to be captured
       }
     } catch (e) {
       console.error('Zlack: Failed to invoke notify', e);
@@ -142,24 +167,11 @@ document.addEventListener('click', (e) => {
     const target = e.target.closest('a');
     if (target && target.href) {
         // Check if it's an external link (http/https) and NOT part of the Slack app itself
-        // Slack internal links might use other protocols or be relative.
-        // We generally want to open http/https links that are not just navigation within the app.
-        // A simple heuristic is: if it starts with http and has target="_blank", it's likely internal logic wanting a new window, 
-        // OR it's an external link.
-        
-        // However, the user said "make ALL links in the slack webview, open on system browser."
-        // We must be careful not to break internal navigation (like switching channels).
-        // Slack channels often look like: https://app.slack.com/client/T0123/C0123
-        
         const href = target.href;
         const isExternal = href.startsWith('http') && 
                            !href.includes('app.slack.com') && 
                            !href.includes('slack.com');
 
-        // If the user REALLY wants "all links" including internal usage to open in browser, that would break the app.
-        // I assume they mean "messages links" to Jira, GitHub, Google Drive etc.
-        
-        // Additionally, Slack wrappers often use target="_blank" as a strong signal for "open externally".
         const opensInNewTab = target.target === '_blank';
 
         if (isExternal || opensInNewTab) {
