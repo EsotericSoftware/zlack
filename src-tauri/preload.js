@@ -174,13 +174,19 @@ document.addEventListener('click', (e) => {
 
         const opensInNewTab = target.target === '_blank';
 
-        if (isExternal || opensInNewTab) {
+        if (isExternal) {
             console.log("Zlack: Intercepted external link click:", href);
             e.preventDefault();
             e.stopPropagation();
             if (window.__TAURI__) {
                 window.__TAURI__.shell.open(href);
             }
+        } else if (opensInNewTab) {
+            // Internal link meant for new tab -> force open in this window
+            console.log("Zlack: Force-opening internal new-tab link in same window:", href);
+            e.preventDefault();
+            e.stopPropagation();
+            window.location.href = href;
         }
     }
 }, true); // Capture phase to ensure we get it before Slack

@@ -1,6 +1,6 @@
 [package]
 name = "Zlack"
-version = "1.1.0"
+version = "1.1.1"
 description = "A Tauri App"
 authors = ["sanguneo"]
 edition = "2021"

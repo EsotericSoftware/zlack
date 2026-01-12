@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Notification Clicks**: Resolved issue where clicking a notification failed to restore/focus the window from the tray.
+- **Link Handling**: Fixed issue where internal Slack links (e.g., workspace sign-in) with `target="_blank"` unintendedly opened in the external system browser.
 - **Rust Ownership**: Fixed `app_handle` borrow checker errors in the notification callback closure.
 
 ## [1.1.0] - 2026-01-09
