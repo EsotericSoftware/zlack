@@ -20,10 +20,15 @@
 
 ## 📦 Installation
 
-You can download the latest installer from the `dists` folder (if built locally) or Releases.
+Download the installer for your OS:
 
-1.  Run `Zlack_1.1.0_x64-setup.exe`.
-2.  Launch **Zlack** from your Start Menu.
+| Platform | File |
+|----------|------|
+| **Windows** | `Zlack.exe` or `Zlack_${version}_window.msi` |
+| **macOS** | `Zlack_${version}_macos.dmg` |
+
+1.  Run the installer.
+2.  Launch **Zlack**.
 3.  Log in to your Slack workspaces.
 
 ## 🏗 Development
@@ -62,16 +67,16 @@ This requires running on a Mac or Linux machine. It will generate `.dmg`/`.app` 
 ## 🧩 How It Works
 
 ### Notification Interception
-Slack's web client logs internal events to the console. Zlack's `preload.js` intercepts these logs:
-1.  Captures `[COUNTS]` and `[NOTIFICATIONS]` logs to identify the current `Team ID` and `Channel ID`.
+Slack's web client sends telemetry traces to `/traces/v1/list_of_spans`. Zlack's `preload.js` intercepts this network traffic:
+1.  Captures `notification:sent` spans to reliably identify the `Team ID` and `Channel ID` associated with the event.
 2.  Intercepts the browser's `Notification` API request.
-3.  Merges the content with the captured IDs and sends it to the Rust backend.
+3.  Merges the content with the captured network context and sends it to the Rust backend.
 
 ### Robust Window Restoration
-Clicking a notification on Windows while an app is minimized is notoriously tricky. Zlack solves this by:
-1.  Using a native Windows Toast callback (via `tauri-winrt-notification`).
-2.  Explicitly calling `unminimize()`, `show()`, and `set_focus()` on the native window handle.
-3.  Listening for the `Focus` event to trigger webview navigation only *after* the window is fully awake.
+Clicking a notification on Windows while an app is minimized is notoriously tricky due to OS foreground rules. Zlack solves this by:
+1.  **Main Thread Architecture**: Creates notification objects directly on the main thread to ensure proper COM listener persistence.
+2.  **Staged Restoration**: Explicitly calls `set_skip_taskbar(false)`, `unminimize()`, and `show()` in the correct order.
+3.  **Focus Hack**: Uses a temporary "Always On Top" toggle to force the window into the foreground even if Windows tries to suppress it.
 
 ## 📄 License
 
