@@ -13,12 +13,7 @@ use tauri::api::notification::Notification;
 #[cfg(target_os = "windows")]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
-use std::sync::Mutex;
-use lazy_static::lazy_static;
 
-lazy_static! {
-    static ref PENDING_NAVIGATION_URL: Mutex<Option<String>> = Mutex::new(None);
-}
 
 #[tauri::command]
 fn notify(app_handle: tauri::AppHandle, title: String, body: String, team_id: Option<String>, channel_id: Option<String>) {
@@ -33,17 +28,13 @@ fn notify(app_handle: tauri::AppHandle, title: String, body: String, team_id: Op
        }
   }
 
-  // Set global pending URL for Focus handler (Dev mode fallback)
-  if let Some(ref url) = target_url {
-      if let Ok(mut pending) = PENDING_NAVIGATION_URL.lock() {
-          *pending = Some(url.clone());
-      }
-  }
+
 
   #[cfg(target_os = "windows")]
   {
       let app_handle_clone = app_handle.clone();
       let identifier = app_handle.config().tauri.bundle.identifier.clone();
+      let target_url_clone = target_url.clone();
 
       // EXECUTE ON MAIN THREAD:
       // We create the toast on the main thread to ensure the COM apartment/listener
@@ -58,11 +49,24 @@ fn notify(app_handle: tauri::AppHandle, title: String, body: String, team_id: Op
                   // Use robust independent clones to avoid borrow errors
                   let app_dispatcher = app_handle_clone.clone();
                   let app_worker = app_handle_clone.clone();
+                  let url_to_open = target_url_clone.clone();
                   
                   // Dispatch to Main Thread again to perform window operations
                   let _ = app_dispatcher.run_on_main_thread(move || {
                       if let Some(window) = app_worker.get_window("main") {
                           restore_window(&window);
+                          
+                          // Explicitly navigate only on click
+                          if let Some(url) = url_to_open {
+                              let js = format!(r#"
+                                if (window.location.href !== '{}') {{
+                                    window.location.href = '{}';
+                                }}
+                              "#, url, url);
+                              if let Err(e) = window.eval(&js) {
+                                  eprintln!("Zlack: Failed to navigate on click: {}", e);
+                              }
+                          }
                       }
                   });
                   Ok(())
@@ -149,26 +153,7 @@ fn main() {
         event.window().hide().unwrap();
         api.prevent_close();
       }
-      WindowEvent::Focused(focused) => {
-          if *focused {
-              // Check for pending navigation on focus
-              if let Ok(mut pending) = PENDING_NAVIGATION_URL.lock() {
-                  if let Some(url) = pending.take() {
-                      let window = event.window();
-                      // Only navigate if URL is different
-                      let js = format!(r#"
-                        if (window.location.href !== '{}') {{
-                            window.location.href = '{}';
-                        }}
-                      "#, url, url);
-                      
-                      if let Err(e) = window.eval(&js) {
-                          eprintln!("Zlack: Failed to navigate: {}", e);
-                      }
-                  }
-              }
-          }
-      }
+      WindowEvent::Focused(_focused) => {}
       _ => {}
     })
     .setup(|app| {
