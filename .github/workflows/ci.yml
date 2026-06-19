@@ -30,8 +30,11 @@ jobs:
           node-version: 18
           cache: npm
 
+      # Pinned to 1.92: Rust 1.93+ changed glob-import trait scoping, which breaks
+      # wry 0.24.11's `use webkit2gtk::{traits::*}` on the Linux (webkit2gtk) path
+      # used by Tauri v1. See tauri-apps/tauri#15149. Unpin after a Tauri v2 upgrade.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.92
         with:
           components: clippy
 
