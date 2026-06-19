@@ -26,5 +26,9 @@ dist-ssr
 # Tauri
 src-tauri/target/
 
+# Bundled fixed-version WebView2 runtime (downloaded, not committed; see build_dist_fixed.ps1)
+src-tauri/webview2-runtime/
+*.cab
+
 # Build dist
 dists

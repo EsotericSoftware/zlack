@@ -12,6 +12,7 @@ tauri-build = { version = "1", features = [] }
 
 [dependencies]
 lazy_static = "1.5.0"
+image = { version = "0.24", default-features = false, features = ["png"] }
 tauri = { version = "1", features = [ "notification-all", "shell-open", "notification", "system-tray"] }
 tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
 

@@ -162,6 +162,75 @@ Object.defineProperty(window, 'Notification', {
 });
 
 
+// 3.5 Unread / mention badge bridge -> native tray icon + window title
+// Slack keeps the browser tab title (document.title) in sync with unread state:
+//   - a parenthesised count "(3) ..."        -> unread DMs / @mentions (RED)
+//   - a leading bullet/asterisk "* ..."       -> other unread messages  (BLUE)
+//   - no prefix                               -> everything read
+// We watch <title> and forward a coarse state to Rust, which mirrors it onto the
+// OS window title (prefixed with "!" for DMs) and swaps the tray icon.
+// The classification is intentionally isolated here so it's easy to adjust if
+// Slack ever changes its title format.
+(function setupBadgeBridge() {
+    const UNREAD_MARKER = /^\s*[\*•●·⁕∗∘◦]+/;
+    const COUNT_MARKER = /^\s*\((\d+)\)/;
+
+    let lastState = null;
+    let lastTitle = null;
+
+    function classify(title) {
+        if (!title) return 'none';
+        if (COUNT_MARKER.test(title)) return 'mention';
+        if (UNREAD_MARKER.test(title)) return 'unread';
+        return 'none';
+    }
+
+    function cleanTitle(title) {
+        return (title || 'Zlack')
+            .replace(COUNT_MARKER, '')
+            .replace(UNREAD_MARKER, '')
+            .trim() || 'Zlack';
+    }
+
+    function push() {
+        const raw = document.title || 'Zlack';
+        const state = classify(raw);
+        const clean = cleanTitle(raw);
+        if (state === lastState && clean === lastTitle) return;
+        lastState = state;
+        lastTitle = clean;
+        try {
+            if (window.__TAURI__) {
+                window.__TAURI__.invoke('update_badge', { state: state, title: clean });
+            }
+        } catch (e) {
+            console.error('Zlack: update_badge failed', e);
+        }
+    }
+
+    function start() {
+        const head = document.querySelector('head');
+        if (head) {
+            // subtree covers <title> being replaced by Slack's SPA, plus its text edits.
+            new MutationObserver(push).observe(head, {
+                subtree: true,
+                childList: true,
+                characterData: true,
+            });
+        }
+        // Safety net in case the observed nodes get swapped out entirely.
+        setInterval(push, 3000);
+        push();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+})();
+
+
 // 4. Intercept External Links
 document.addEventListener('click', (e) => {
     const target = e.target.closest('a');

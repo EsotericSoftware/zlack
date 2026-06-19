@@ -13,7 +13,88 @@ use tauri::api::notification::Notification;
 #[cfg(target_os = "windows")]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
+use tauri::Icon;
 
+// --- Tray icon badges -------------------------------------------------------
+// We composite a small coloured dot onto the base tray icon to mirror Slack's
+// behaviour: a red badge for unread DMs / @mentions and a blue badge for other
+// unread messages. The three variants are built once and reused.
+
+fn draw_badge(img: &mut image::RgbaImage, color: [u8; 3]) {
+  let (w, h) = (img.width() as i32, img.height() as i32);
+  let r = (w as f32 * 0.32).round() as i32; // badge radius (~1/3 of the icon)
+  let cx = w - r - 1; // bottom-right corner
+  let cy = h - r - 1;
+  for y in (cy - r - 2)..(cy + r + 2) {
+    for x in (cx - r - 2)..(cx + r + 2) {
+      if x < 0 || y < 0 || x >= w || y >= h {
+        continue;
+      }
+      let dx = (x - cx) as f32;
+      let dy = (y - cy) as f32;
+      let dist = (dx * dx + dy * dy).sqrt();
+      if dist <= r as f32 {
+        img.put_pixel(x as u32, y as u32, image::Rgba([color[0], color[1], color[2], 255]));
+      } else if dist <= r as f32 + 1.5 {
+        // White ring so the badge stays visible against any background.
+        img.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
+      }
+    }
+  }
+}
+
+fn make_icon(badge: Option<[u8; 3]>) -> Icon {
+  let base = include_bytes!("../icons/32x32.png");
+  let mut img = image::load_from_memory(base)
+    .expect("Zlack: failed to decode tray icon")
+    .to_rgba8();
+  if let Some(color) = badge {
+    draw_badge(&mut img, color);
+  }
+  let (w, h) = (img.width(), img.height());
+  Icon::Rgba { rgba: img.into_raw(), width: w, height: h }
+}
+
+lazy_static::lazy_static! {
+  static ref ICON_NORMAL: Icon = make_icon(None);
+  static ref ICON_BLUE: Icon = make_icon(Some([41, 120, 240]));   // general unread
+  static ref ICON_RED: Icon = make_icon(Some([224, 30, 90]));     // DM / mention
+}
+
+// Bridge from the Slack web app (see preload.js): reflects unread state onto the
+// OS window title and the system-tray icon.
+//   state: "mention" (red) | "unread" (blue) | "none"
+//   title: Slack's tab title with its own unread markers already stripped
+#[tauri::command]
+fn update_badge(app_handle: tauri::AppHandle, state: String, title: String) {
+  if let Some(window) = app_handle.get_window("main") {
+    let new_title = if state == "mention" {
+      format!("! {}", title)
+    } else {
+      title.clone()
+    };
+    let _ = window.set_title(&new_title);
+  }
+
+  let tray = app_handle.tray_handle();
+  match state.as_str() {
+    "mention" => {
+      #[cfg(target_os = "macos")]
+      let _ = tray.set_icon_as_template(false);
+      let _ = tray.set_icon(ICON_RED.clone());
+    }
+    "unread" => {
+      #[cfg(target_os = "macos")]
+      let _ = tray.set_icon_as_template(false);
+      let _ = tray.set_icon(ICON_BLUE.clone());
+    }
+    _ => {
+      #[cfg(target_os = "macos")]
+      let _ = tray.set_icon_as_template(true);
+      let _ = tray.set_icon(ICON_NORMAL.clone());
+    }
+  }
+}
 
 #[tauri::command]
 fn notify(app_handle: tauri::AppHandle, title: String, body: String, team_id: Option<String>, channel_id: Option<String>) {
@@ -178,7 +259,7 @@ fn main() {
       .build()?;
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![notify])
+    .invoke_handler(tauri::generate_handler![notify, update_badge])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

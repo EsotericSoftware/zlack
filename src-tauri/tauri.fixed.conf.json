@@ -1,0 +1,12 @@
+{
+  "tauri": {
+    "bundle": {
+      "windows": {
+        "webviewInstallMode": {
+          "type": "fixedRuntime",
+          "path": "webview2-runtime/"
+        }
+      }
+    }
+  }
+}

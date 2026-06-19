@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Unread Badges** ([#3](https://github.com/sanguneo/zlack/issues/3)): The system-tray icon now shows a coloured badge that mirrors Slack's unread state — red for unread DMs / @mentions, blue for other unread messages — and the window title is prefixed with `!` when there are unread DMs / mentions. Detection is driven from the Slack tab title in `preload.js`; native rendering lives in `main.rs`.
+- **Fixed WebView2 Runtime Build** ([#2](https://github.com/sanguneo/zlack/issues/2)): Added an optional Windows build (`npm run build:dist:windows:fixed`) that bundles a private, fixed-version WebView2 runtime inside Zlack's directory via `webviewInstallMode: fixedRuntime`. This lets users scope a software-firewall rule to Zlack instead of allowing the shared system WebView2. The default build is unchanged (smaller, shared runtime).
+
 ## [1.1.2] - 2026-01-21
 
 ### Added
