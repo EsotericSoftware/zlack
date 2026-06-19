@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri/WebKit dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev build-essential curl wget file \
+            libssl-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Sync version metadata
+        run: npm run update-version
+
+      # Advisory lint pass; does not fail the build (the codebase predates a
+      # clippy-clean baseline). Tighten to `-- -D warnings` once it is clean.
+      - name: Clippy (advisory)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
+
+      # Hard gate: the Rust backend must compile on every target OS. This is what
+      # catches issues like a removed-but-still-needed dependency.
+      - name: Compile (debug)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --verbose

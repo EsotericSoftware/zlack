@@ -26,8 +26,8 @@
 
 | 플랫폼 | 파일명 |
 |----------|------|
-| **Windows** | `Zlack.exe` 또는 `Zlack_${version}_window.msi` |
-| **macOS** | `Zlack_${version}_macos.dmg` |
+| **Windows** | `Zlack_${version}_x64-setup.exe` (설치 프로그램) 또는 `Zlack_${version}_x64_en-US.msi` |
+| **macOS** | `Zlack_${version}_x64.dmg` |
 
 1.  설치 파일을 실행합니다.
 2.  시작 메뉴에서 **Zlack**을 실행합니다.

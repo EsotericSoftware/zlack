@@ -37,7 +37,15 @@ navigator.permissions.query = (parameters) => {
 
 
 // 2.5 Intercept Network Requests (Telemetry) for Notification Context
-let lastEventContext = { teamId: 'unknown', channelId: 'unknown' };
+let lastEventContext = { teamId: 'unknown', channelId: 'unknown', ts: 0 };
+// Correlation rules for attaching channel context to a notification:
+//   - every telemetry capture stamps lastEventContext.ts (Date.now()).
+//   - a notification only adopts the context if it was captured within
+//     CONTEXT_FRESHNESS_MS before (or NOTIFY_DELAY_MS after) the notification.
+//   This prevents a channel-less notification from inheriting a previous
+//   notification's team/channel (the old fixed-snapshot bug).
+const NOTIFY_DELAY_MS = 500;       // grace period for a slightly-delayed telemetry beacon
+const CONTEXT_FRESHNESS_MS = 5000; // max age of context still considered "this notification's"
 
 
 function processTelemetryBody(bodyStr) {
@@ -62,6 +70,7 @@ function processTelemetryBody(bodyStr) {
                     console.log(`[Zlack] Captured context from network: Team=${tid}, Channel=${cid}`);
                     lastEventContext.teamId = tid;
                     lastEventContext.channelId = cid;
+                    lastEventContext.ts = Date.now();
                 }
             }
         });
@@ -111,21 +120,29 @@ const ZlackNotification = class {
     // Store as global pending notification
     window.__ZlackPendingNotification = this;
 
+    const createdAt = Date.now();
+    const originalBody = this.options.body || '';
+    const notifyTitle = typeof title === 'string' ? title : 'New Message';
+
     try {
       if (window.__TAURI__) {
-          // Delay slightly to ensure network/console logs have updated context
+          // Wait briefly so a slightly-delayed telemetry beacon can still land,
+          // then only adopt the captured context if it belongs to THIS notification.
           setTimeout(() => {
-              const teamId = lastEventContext.teamId || 'unknown';
-              const channelId = lastEventContext.channelId || 'unknown';
-              const originalBody = this.options.body || '';
-              
-              window.__TAURI__.invoke('notify', { 
-                title: typeof title === 'string' ? title : 'New Message', 
+              const age = createdAt - lastEventContext.ts; // >0 captured before, <0 after
+              const fresh = lastEventContext.ts > 0
+                  && age <= CONTEXT_FRESHNESS_MS
+                  && age >= -NOTIFY_DELAY_MS;
+              const teamId = fresh ? (lastEventContext.teamId || 'unknown') : 'unknown';
+              const channelId = fresh ? (lastEventContext.channelId || 'unknown') : 'unknown';
+
+              window.__TAURI__.invoke('notify', {
+                title: notifyTitle,
                 body: originalBody,
                 teamId: teamId,
                 channelId: channelId
               });
-          }, 500); // Wait for network telemetry to be captured
+          }, NOTIFY_DELAY_MS);
       }
     } catch (e) {
       console.error('Zlack: Failed to invoke notify', e);
@@ -147,7 +164,7 @@ const ZlackNotification = class {
   
   removeEventListener(type, listener) {
     if (type === 'click') {
-        this.clickHandlers.filter(l => l !== listener);
+        this.clickHandlers = this.clickHandlers.filter(l => l !== listener);
     }
   }
 
@@ -177,6 +194,7 @@ Object.defineProperty(window, 'Notification', {
 
     let lastState = null;
     let lastTitle = null;
+    let lastCount = null;
 
     function classify(title) {
         if (!title) return 'none';
@@ -196,12 +214,15 @@ Object.defineProperty(window, 'Notification', {
         const raw = document.title || 'Zlack';
         const state = classify(raw);
         const clean = cleanTitle(raw);
-        if (state === lastState && clean === lastTitle) return;
+        const m = COUNT_MARKER.exec(raw);
+        const count = m ? parseInt(m[1], 10) : null;
+        if (state === lastState && clean === lastTitle && count === lastCount) return;
         lastState = state;
         lastTitle = clean;
+        lastCount = count;
         try {
             if (window.__TAURI__) {
-                window.__TAURI__.invoke('update_badge', { state: state, title: clean });
+                window.__TAURI__.invoke('update_badge', { state: state, title: clean, count: count });
             }
         } catch (e) {
             console.error('Zlack: update_badge failed', e);

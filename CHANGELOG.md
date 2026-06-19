@@ -7,9 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-19
+
 ### Added
-- **Unread Badges** ([#3](https://github.com/sanguneo/zlack/issues/3)): The system-tray icon now shows a coloured badge that mirrors Slack's unread state — red for unread DMs / @mentions, blue for other unread messages — and the window title is prefixed with `!` when there are unread DMs / mentions. Detection is driven from the Slack tab title in `preload.js`; native rendering lives in `main.rs`.
+- **Unread Badges** ([#3](https://github.com/sanguneo/zlack/issues/3)): Zlack now mirrors Slack's unread state without relying on popup notifications — red for unread DMs / @mentions, blue for other unread messages. It is shown in three places: the system-tray icon swaps to a badged variant, the **Windows taskbar button gets an overlay badge** (`ITaskbarList3::SetOverlayIcon`, stamped with the unread DM/mention count when available), and the window title is prefixed with `!` when there are unread DMs / mentions. Detection is driven from the Slack tab title in `preload.js`; native rendering lives in `main.rs`.
 - **Fixed WebView2 Runtime Build** ([#2](https://github.com/sanguneo/zlack/issues/2)): Added an optional Windows build (`npm run build:dist:windows:fixed`) that bundles a private, fixed-version WebView2 runtime inside Zlack's directory via `webviewInstallMode: fixedRuntime`. This lets users scope a software-firewall rule to Zlack instead of allowing the shared system WebView2. The default build is unchanged (smaller, shared runtime).
+
+### Changed
+- **Notification context correlation**: `preload.js` now timestamps captured Slack telemetry and only attaches a team/channel to a notification when that context was captured close in time to it, so a notification without its own context no longer inherits the previously captured channel.
+- **Tray icon startup**: The tray icon is normalised to the rendered 32px base at launch, so the larger bundled icon no longer briefly flashes before the first unread-state update.
+
+### Fixed
+- **Windows build script**: `npm run build:dist:windows` invoked a non-existent `tauri build:windows` subcommand and never actually built; it now runs `tauri build` and fails fast on a non-zero exit code.
+- **Notification shim**: `Notification.removeEventListener` discarded its filtered result and never removed click handlers; it now reassigns the handler list.
+
+### Removed
+- **Starter scaffolding**: Removed the leftover Tauri template (`greet` demo `main.js`, `styles.css`, sample SVG assets) from `src/`; the bundled `index.html` is now a minimal branded splash placeholder.
+- **Unused crate metadata**: Dropped the redundant `notification` Cargo feature (already covered by `notification-all`) and the unused `serde` and `serde_json` Windows dependencies. (The `windows` crate is retained — it now powers the taskbar overlay badge.)
 
 ## [1.1.2] - 2026-01-21
 

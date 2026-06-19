@@ -26,8 +26,8 @@ Download the installer for your OS:
 
 | Platform | File |
 |----------|------|
-| **Windows** | `Zlack.exe` or `Zlack_${version}_window.msi` |
-| **macOS** | `Zlack_${version}_macos.dmg` |
+| **Windows** | `Zlack_${version}_x64-setup.exe` (installer) or `Zlack_${version}_x64_en-US.msi` |
+| **macOS** | `Zlack_${version}_x64.dmg` |
 
 1.  Run the installer.
 2.  Launch **Zlack**.
