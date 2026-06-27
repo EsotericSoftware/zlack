@@ -3,11 +3,13 @@
     windows_subsystem = "windows"
 )]
 
+use std::{collections::HashMap, sync::Mutex};
 #[cfg(not(target_os = "windows"))]
 use tauri::api::notification::Notification;
+
 use tauri::{
-    CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem,
-    WindowEvent,
+    scope::ipc::RemoteDomainAccessScope, CustomMenuItem, Manager, PhysicalPosition, PhysicalSize,
+    Position, Size, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem, WindowEvent,
 };
 
 #[cfg(target_os = "windows")]
@@ -316,27 +318,99 @@ fn set_taskbar_overlay(window: &tauri::Window, color: Option<[u8; 3]>, count: Op
     }
 }
 
-// Bridge from the Slack web app (see preload.js): reflects unread state onto the
-// OS window title and the system-tray icon.
-//   state: "mention" (red) | "unread" (blue) | "none"
-//   title: Slack's tab title with its own unread markers already stripped
-#[tauri::command]
-fn update_badge(app_handle: tauri::AppHandle, state: String, title: String, count: Option<u32>) {
-    debug_log(&format!(
-        "[update_badge] state={} count={:?} title={:?}",
-        state, count, title
-    ));
-    if let Some(window) = app_handle.get_window("main") {
-        let new_title = if state == "mention" {
-            format!("! {}", title)
-        } else {
-            title.clone()
-        };
-        let _ = window.set_title(&new_title);
+#[derive(Clone, Default)]
+struct BadgeInfo {
+    state: String,
+    title: String,
+}
+
+#[derive(Default)]
+struct WorkspaceState {
+    active_label: String,
+    active_title: String,
+    label_by_team: HashMap<String, String>,
+    team_by_label: HashMap<String, String>,
+    badges: HashMap<String, BadgeInfo>,
+}
+
+fn user_agent() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    } else {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    }
+}
+
+fn workspace_label(team: &str) -> String {
+    let safe: String = team
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("workspace-{}", safe)
+}
+
+fn allow_remote_ipc_for_label(app: &tauri::AppHandle, label: &str) {
+    for domain in ["app.slack.com", "slack.com"] {
+        app.ipc_scope().configure_remote_access(
+            RemoteDomainAccessScope::new(domain)
+                .add_window(label)
+                .enable_tauri_api(),
+        );
+    }
+}
+
+fn active_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
+    let label = app
+        .try_state::<Mutex<WorkspaceState>>()
+        .map(|state| {
+            let state = state.lock().unwrap();
+            if state.active_label.is_empty() {
+                "main".to_string()
+            } else {
+                state.active_label.clone()
+            }
+        })
+        .unwrap_or_else(|| "main".to_string());
+    app.get_window(&label).or_else(|| app.get_window("main"))
+}
+
+fn aggregate_badge(state: &WorkspaceState) -> (String, String) {
+    let mut aggregate = "none";
+    for badge in state.badges.values() {
+        match (aggregate, badge.state.as_str()) {
+            ("mention", _) => {}
+            (_, "mention") => aggregate = "mention",
+            ("none", "unread") => aggregate = "unread",
+            _ => {}
+        }
+    }
+    let title = if state.active_title.is_empty() {
+        "Zlack".to_string()
+    } else {
+        state.active_title.clone()
+    };
+    (aggregate.to_string(), title)
+}
+
+fn apply_global_badge(app_handle: &tauri::AppHandle, state: &str, title: &str) {
+    let title = if state == "mention" {
+        format!("! {}", title)
+    } else {
+        title.to_string()
+    };
+
+    if let Some(window) = active_window(app_handle) {
+        let _ = window.set_title(&title);
     }
 
     let tray = app_handle.tray_handle();
-    match state.as_str() {
+    match state {
         "mention" => {
             #[cfg(target_os = "macos")]
             let _ = tray.set_icon_as_template(false);
@@ -357,9 +431,9 @@ fn update_badge(app_handle: tauri::AppHandle, state: String, title: String, coun
     #[cfg(target_os = "windows")]
     {
         let app = app_handle.clone();
-        let state_for_overlay = state.clone();
+        let state_for_overlay = state.to_string();
         let _ = app_handle.run_on_main_thread(move || {
-            if let Some(window) = app.get_window("main") {
+            if let Some(window) = active_window(&app) {
                 let color = match state_for_overlay.as_str() {
                     "mention" => Some([224u8, 30, 90]),
                     "unread" => Some([41u8, 120, 240]),
@@ -379,6 +453,307 @@ fn update_badge(app_handle: tauri::AppHandle, state: String, title: String, coun
             }
         });
     }
+}
+
+fn create_workspace_window(
+    app: &tauri::AppHandle,
+    team: &str,
+    label: &str,
+    visible: bool,
+    url: Option<String>,
+) -> tauri::Result<tauri::Window> {
+    allow_remote_ipc_for_label(app, label);
+    let target_url = url.unwrap_or_else(|| {
+        if team.contains('.') {
+            format!("https://{}/client", team)
+        } else {
+            format!("https://app.slack.com/client/{}", team)
+        }
+    });
+    if let Some(domain) = target_url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+    {
+        if domain.ends_with("slack.com") {
+            app.ipc_scope().configure_remote_access(
+                RemoteDomainAccessScope::new(domain)
+                    .add_window(label)
+                    .enable_tauri_api(),
+            );
+        }
+    }
+    let window = tauri::WindowBuilder::new(
+        app,
+        label,
+        tauri::WindowUrl::External(target_url.parse().unwrap()),
+    )
+    .additional_browser_args("--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding")
+    .user_agent(user_agent())
+    .title("Zlack")
+    .inner_size(1200.0, 800.0)
+    .resizable(true)
+    .visible(visible)
+    .initialization_script(include_str!("../preload.js"))
+    .disable_file_drop_handler()
+    .build()?;
+    let _ = window.set_skip_taskbar(!visible);
+    if !visible {
+        // WebView2 may not fully initialize/network until a window has been shown at
+        // least once. Warm hidden workspaces off-screen so their websocket/counts
+        // start flowing, then hide them again before the user sees anything.
+        let _ = window.set_position(Position::Physical(PhysicalPosition {
+            x: -32000,
+            y: -32000,
+        }));
+        let _ = window.show();
+        let _ = window.hide();
+    }
+    Ok(window)
+}
+
+fn ensure_workspace_window(
+    app: &tauri::AppHandle,
+    team: &str,
+    url: Option<String>,
+) -> Option<String> {
+    let label = {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        if let Some(label) = state.label_by_team.get(team) {
+            label.clone()
+        } else {
+            let label = workspace_label(team);
+            state.label_by_team.insert(team.to_string(), label.clone());
+            state.team_by_label.insert(label.clone(), team.to_string());
+            label
+        }
+    };
+
+    if app.get_window(&label).is_none()
+        && create_workspace_window(app, team, &label, false, url).is_err()
+    {
+        return None;
+    }
+    Some(label)
+}
+
+fn show_workspace_for_switch(window: &tauri::Window) {
+    let _ = window.set_skip_taskbar(false);
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn sync_hidden_workspace_geometry(app: &tauri::AppHandle, source: &tauri::Window) {
+    let source_label = source.label().to_string();
+    let labels = {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let state = state.lock().unwrap();
+        if state.active_label != source_label {
+            return;
+        }
+        state.team_by_label.keys().cloned().collect::<Vec<_>>()
+    };
+    let maximized = source.is_maximized().unwrap_or(false);
+    let pos = source.outer_position().ok();
+    let size = source.inner_size().ok();
+
+    for label in labels {
+        if label == source_label {
+            continue;
+        }
+        if let Some(window) = app.get_window(&label) {
+            if maximized {
+                let _ = window.maximize();
+            } else {
+                let _ = window.unmaximize();
+                if let Some(pos) = pos {
+                    let _ = window
+                        .set_position(Position::Physical(PhysicalPosition { x: pos.x, y: pos.y }));
+                }
+                if let Some(size) = size {
+                    let _ = window.set_size(Size::Physical(PhysicalSize {
+                        width: size.width,
+                        height: size.height,
+                    }));
+                }
+            }
+        }
+    }
+}
+
+fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) {
+    let target_label = match ensure_workspace_window(app, team, url.clone()) {
+        Some(label) => label,
+        None => return,
+    };
+    let current = active_window(app);
+    let target = match app.get_window(&target_label) {
+        Some(window) => window,
+        None => return,
+    };
+    let was_maximized = current
+        .as_ref()
+        .and_then(|window| window.is_maximized().ok())
+        .unwrap_or(false);
+
+    if let Some(current) = current.as_ref() {
+        if current.label() != target_label {
+            if was_maximized {
+                let _ = target.maximize();
+            } else {
+                let _ = target.unmaximize();
+                if let Ok(pos) = current.outer_position() {
+                    let _ = target
+                        .set_position(Position::Physical(PhysicalPosition { x: pos.x, y: pos.y }));
+                }
+                if let Ok(size) = current.inner_size() {
+                    let _ = target.set_size(Size::Physical(PhysicalSize {
+                        width: size.width,
+                        height: size.height,
+                    }));
+                }
+            }
+        }
+    }
+
+    {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        state.active_label = target_label.clone();
+        if let Some(team) = state.team_by_label.get(&target_label) {
+            if let Some(badge) = state.badges.get(team) {
+                state.active_title = badge.title.clone();
+            }
+        } else if let Some(badge) = state.badges.get(&target_label) {
+            state.active_title = badge.title.clone();
+        }
+    }
+
+    if let Some(url) = url {
+        let js_url = format!("{:?}", url);
+        let js = format!(
+            r#"if (window.location.href !== {0}) {{ window.location.href = {0}; }}"#,
+            js_url
+        );
+        let _ = target.eval(&js);
+    }
+
+    if current.as_ref().map(|w| w.label()) != Some(target_label.as_str()) {
+        show_workspace_for_switch(&target);
+        if let Some(current) = current {
+            let _ = current.set_skip_taskbar(true);
+            let _ = current.hide();
+        }
+    } else {
+        restore_window(&target);
+    }
+
+    let (state, title) = {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let state = state.lock().unwrap();
+        aggregate_badge(&state)
+    };
+    apply_global_badge(app, &state, &title);
+    sync_hidden_workspace_geometry(app, &target);
+}
+
+#[tauri::command]
+fn register_workspaces(
+    window: tauri::Window,
+    app_handle: tauri::AppHandle,
+    teams: Vec<String>,
+    active: Option<String>,
+) {
+    let active = active.filter(|team| !team.is_empty());
+    let label = window.label().to_string();
+    if let Some(active_team) = active.as_ref() {
+        let state = app_handle.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        state
+            .label_by_team
+            .entry(active_team.clone())
+            .or_insert_with(|| label.clone());
+        state
+            .team_by_label
+            .entry(label.clone())
+            .or_insert_with(|| active_team.clone());
+        if state.active_label.is_empty() {
+            state.active_label = "main".to_string();
+        }
+    }
+
+    let app = app_handle.clone();
+    std::thread::spawn(move || {
+        for team in teams {
+            if active.as_ref() == Some(&team) {
+                continue;
+            }
+            let _ = ensure_workspace_window(&app, &team, None);
+        }
+    });
+}
+
+#[tauri::command]
+fn switch_workspace(app_handle: tauri::AppHandle, team: String, url: Option<String>) {
+    let app = app_handle.clone();
+    std::thread::spawn(move || {
+        switch_to_workspace(&app, &team, url);
+    });
+}
+
+// Bridge from the Slack web app (see preload.js): reflects unread state onto the
+// OS window title and the system-tray icon. Each workspace window reports its own
+// state; Rust aggregates all workspaces red > blue > none.
+//   state: "mention" (red) | "unread" (blue) | "none"
+//   title: Slack's tab title with its own unread markers already stripped
+#[tauri::command]
+fn update_badge(
+    window: tauri::Window,
+    app_handle: tauri::AppHandle,
+    state: String,
+    title: String,
+    _count: Option<u32>,
+    team: Option<String>,
+) {
+    let (aggregate, active_title) = {
+        let workspace_state = app_handle.state::<Mutex<WorkspaceState>>();
+        let mut workspace_state = workspace_state.lock().unwrap();
+        if workspace_state.active_label.is_empty() {
+            workspace_state.active_label = "main".to_string();
+        }
+
+        let label = window.label().to_string();
+        let key = team
+            .clone()
+            .or_else(|| workspace_state.team_by_label.get(&label).cloned())
+            .unwrap_or_else(|| label.clone());
+        if let Some(team) = team {
+            workspace_state
+                .label_by_team
+                .entry(team.clone())
+                .or_insert_with(|| label.clone());
+            workspace_state
+                .team_by_label
+                .entry(label.clone())
+                .or_insert(team);
+        }
+
+        workspace_state.badges.insert(
+            key,
+            BadgeInfo {
+                state: state.clone(),
+                title: title.clone(),
+            },
+        );
+        if label == workspace_state.active_label {
+            workspace_state.active_title = title.clone();
+        }
+        aggregate_badge(&workspace_state)
+    };
+
+    apply_global_badge(&app_handle, &aggregate, &active_title);
 }
 
 #[tauri::command]
@@ -419,26 +794,14 @@ fn notify(
                     let app_dispatcher = app_handle_clone.clone();
                     let app_worker = app_handle_clone.clone();
                     let url_to_open = target_url_clone.clone();
+                    let team_to_open = team_id.clone();
 
                     // Dispatch to Main Thread again to perform window operations
                     let _ = app_dispatcher.run_on_main_thread(move || {
-                        if let Some(window) = app_worker.get_window("main") {
+                        if let Some(team) = team_to_open.filter(|team| team != "unknown") {
+                            switch_to_workspace(&app_worker, &team, url_to_open);
+                        } else if let Some(window) = active_window(&app_worker) {
                             restore_window(&window);
-
-                            // Explicitly navigate only on click
-                            if let Some(url) = url_to_open {
-                                let js = format!(
-                                    r#"
-                                if (window.location.href !== '{}') {{
-                                    window.location.href = '{}';
-                                }}
-                              "#,
-                                    url, url
-                                );
-                                if let Err(e) = window.eval(&js) {
-                                    eprintln!("Zlack: Failed to navigate on click: {}", e);
-                                }
-                            }
                         }
                     });
                     Ok(())
@@ -498,22 +861,26 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+    .manage(Mutex::new(WorkspaceState::default()))
     .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-      let window = app.get_window("main").unwrap();
-      restore_window(&window);
+      if let Some(window) = active_window(app) {
+        restore_window(&window);
+      }
     }))
     .system_tray(system_tray)
     .on_system_tray_event(|app, event| match event {
       SystemTrayEvent::LeftClick { .. } => {
-        let window = app.get_window("main").unwrap();
-        restore_window(&window);
+        if let Some(window) = active_window(app) {
+          restore_window(&window);
+        }
       }
       SystemTrayEvent::MenuItemClick { id, .. } => {
         match id.as_str() {
           "quit" => { std::process::exit(0); }
           "show" => {
-            let window = app.get_window("main").unwrap();
-            restore_window(&window);
+            if let Some(window) = active_window(app) {
+              restore_window(&window);
+            }
           }
           _ => {}
         }
@@ -526,22 +893,21 @@ fn main() {
         api.prevent_close();
       }
       WindowEvent::Focused(_focused) => {}
+      WindowEvent::Resized(_) | WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+        let app = event.window().app_handle();
+        sync_hidden_workspace_geometry(&app, event.window());
+      }
       _ => {}
     })
     .setup(|app| {
+      allow_remote_ipc_for_label(&app.handle(), "main");
       let _window = tauri::WindowBuilder::new(
         app,
         "main",
         tauri::WindowUrl::External("https://app.slack.com/client".parse().unwrap())
       )
       .additional_browser_args("--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding")
-      .user_agent(
-        if cfg!(target_os = "macos") {
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-        } else {
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-        }
-      )
+      .user_agent(user_agent())
       .title("Zlack")
       .inner_size(1200.0, 800.0)
       .resizable(true)
@@ -553,7 +919,7 @@ fn main() {
       let _ = app.tray_handle().set_icon(ICON_NORMAL.clone());
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![notify, update_badge])
+    .invoke_handler(tauri::generate_handler![notify, update_badge, register_workspaces, switch_workspace])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
