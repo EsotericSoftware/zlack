@@ -381,9 +381,11 @@ fn ensure_workspace_window(
 }
 
 fn show_workspace_for_switch(window: &tauri::Window) {
-    let _ = window.set_skip_taskbar(false);
     let _ = window.unminimize();
     let _ = window.show();
+    // Re-add after showing. On Windows, adding a hidden WebView back to the
+    // taskbar before it is visible can leave it missing from Alt-Tab.
+    let _ = window.set_skip_taskbar(false);
     let _ = window.set_focus();
 }
 
@@ -486,7 +488,6 @@ fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) 
     if current.as_ref().map(|w| w.label()) != Some(target_label.as_str()) {
         show_workspace_for_switch(&target);
         if let Some(current) = current {
-            let _ = current.set_skip_taskbar(true);
             let _ = current.hide();
         }
     } else {
@@ -679,19 +680,19 @@ fn notify(
 
 // Helper: robustly restore window on Windows and macOS
 fn restore_window(window: &tauri::Window) {
-    // 1. Ensure it stays in taskbar (critical for tray apps)
-    if let Err(e) = window.set_skip_taskbar(false) {
-        eprintln!("Zlack: Failed to set_skip_taskbar: {}", e);
-    }
-
-    // 2. Unminimize (Restore geometry)
+    // 1. Unminimize (Restore geometry)
     if let Err(e) = window.unminimize() {
         eprintln!("Zlack: Failed to Unminimize: {}", e);
     }
 
-    // 3. Force show (Unhide)
+    // 2. Force show (Unhide)
     if let Err(e) = window.show() {
         eprintln!("Zlack: Failed to Show: {}", e);
+    }
+
+    // 3. Ensure it stays in taskbar/Alt-Tab after it is visible.
+    if let Err(e) = window.set_skip_taskbar(false) {
+        eprintln!("Zlack: Failed to set_skip_taskbar: {}", e);
     }
 
     // 4. Force Focus (with hack for stubborn Windows)
