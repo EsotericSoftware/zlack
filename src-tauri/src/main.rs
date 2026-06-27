@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 #[cfg(not(target_os = "windows"))]
 use tauri::api::notification::Notification;
 
@@ -32,22 +32,27 @@ use windows::{
     Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO},
 };
 
-// --- Debug logging (dev builds only) ---------------------------------------
-// In debug builds this appends to <temp>/zlack-debug.log so the unread-badge
-// pipeline can be inspected without a DevTools console; in release it is a no-op.
-fn debug_log(_msg: &str) {
-    #[cfg(debug_assertions)]
-    {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("zlack-debug.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(f, "{}", _msg);
+fn exe_sibling(name: &str) -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+}
+
+#[cfg(target_os = "windows")]
+fn prefer_private_webview2_runtime() {
+    if std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some() {
+        return;
+    }
+    if let Some(runtime) = exe_sibling("webview2-runtime") {
+        if runtime.join("msedgewebview2.exe").is_file() {
+            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", runtime);
         }
     }
+}
+
+#[tauri::command]
+fn load_user_css() -> Option<String> {
+    exe_sibling("zlack.css").and_then(|path| std::fs::read_to_string(path).ok())
 }
 
 // --- Tray icon badges -------------------------------------------------------
@@ -225,13 +230,7 @@ fn rgba_to_hicon(rgba: &[u8], w: u32, h: u32) -> Option<HICON> {
             0,
         ) {
             Ok(b) if !bits.is_null() && b.0 != 0 => b,
-            other => {
-                debug_log(&format!(
-                    "[overlay] CreateDIBSection failed: {:?}",
-                    other.err()
-                ));
-                return None;
-            }
+            _ => return None,
         };
         // Fill the DIB with BGRA pixels.
         let dst = std::slice::from_raw_parts_mut(bits as *mut u8, rgba.len());
@@ -259,13 +258,7 @@ fn rgba_to_hicon(rgba: &[u8], w: u32, h: u32) -> Option<HICON> {
         let _ = DeleteObject(HGDIOBJ(hbm_mask.0));
         match hicon {
             Ok(h) if h.0 != 0 => Some(h),
-            other => {
-                debug_log(&format!(
-                    "[overlay] CreateIconIndirect failed: {:?}",
-                    other.err()
-                ));
-                None
-            }
+            _ => None,
         }
     }
 }
@@ -274,28 +267,17 @@ fn rgba_to_hicon(rgba: &[u8], w: u32, h: u32) -> Option<HICON> {
 fn set_taskbar_overlay(window: &tauri::Window, color: Option<[u8; 3]>, count: Option<u32>) {
     let raw = match window.hwnd() {
         Ok(h) => h.0,
-        Err(e) => {
-            debug_log(&format!("[overlay] hwnd() failed: {:?}", e));
-            return;
-        }
+        Err(_) => return,
     };
-    debug_log(&format!(
-        "[overlay] hwnd={} color={:?} count={:?}",
-        raw, color, count
-    ));
     let hwnd = HWND(raw);
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let taskbar: ITaskbarList3 =
             match CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) {
                 Ok(t) => t,
-                Err(e) => {
-                    debug_log(&format!("[overlay] CoCreateInstance failed: {:?}", e));
-                    return;
-                }
+                Err(_) => return,
             };
-        if let Err(e) = taskbar.HrInit() {
-            debug_log(&format!("[overlay] HrInit failed: {:?}", e));
+        if taskbar.HrInit().is_err() {
             return;
         }
         match color {
@@ -303,16 +285,14 @@ fn set_taskbar_overlay(window: &tauri::Window, color: Option<[u8; 3]>, count: Op
                 let (rgba, w, h) = make_overlay_rgba(c, count);
                 match rgba_to_hicon(&rgba, w, h) {
                     Some(hicon) => {
-                        let r = taskbar.SetOverlayIcon(hwnd, hicon, PCWSTR::null());
-                        debug_log(&format!("[overlay] SetOverlayIcon(icon) -> {:?}", r));
+                        let _ = taskbar.SetOverlayIcon(hwnd, hicon, PCWSTR::null());
                         let _ = DestroyIcon(hicon);
                     }
-                    None => debug_log("[overlay] rgba_to_hicon returned None"),
+                    None => {}
                 }
             }
             None => {
-                let r = taskbar.SetOverlayIcon(hwnd, HICON::default(), PCWSTR::null());
-                debug_log(&format!("[overlay] SetOverlayIcon(clear) -> {:?}", r));
+                let _ = taskbar.SetOverlayIcon(hwnd, HICON::default(), PCWSTR::null());
             }
         }
     }
@@ -851,6 +831,9 @@ fn restore_window(window: &tauri::Window) {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    prefer_private_webview2_runtime();
+
     let quit = CustomMenuItem::new("quit".to_string(), "Quit Zlack");
     let show = CustomMenuItem::new("show".to_string(), "Show Zlack");
     let tray_menu = SystemTrayMenu::new()
@@ -919,7 +902,13 @@ fn main() {
       let _ = app.tray_handle().set_icon(ICON_NORMAL.clone());
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![notify, update_badge, register_workspaces, switch_workspace])
+    .invoke_handler(tauri::generate_handler![
+      notify,
+      load_user_css,
+      update_badge,
+      register_workspaces,
+      switch_workspace
+    ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

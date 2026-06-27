@@ -747,6 +747,22 @@ function processBadgeSocketMessage(data) {
         badgePush();
     }
 
+    function injectUserCss(css) {
+        if (!css || typeof css !== 'string') return;
+        let style = document.getElementById('zlack-user-css');
+        if (!style) {
+            style = document.createElement('style');
+            style.id = 'zlack-user-css';
+            style.type = 'text/css';
+            (document.head || document.documentElement).appendChild(style);
+        }
+        style.textContent = css;
+    }
+
+    function loadUserCss() {
+        tauriInvoke('load_user_css').then(injectUserCss).catch(() => {});
+    }
+
     function closestFromEventTarget(target, selector) {
         const el = target && (target.closest ? target : target.parentElement);
         return el && el.closest ? el.closest(selector) : null;
@@ -902,6 +918,7 @@ function processBadgeSocketMessage(data) {
             registerCachedWorkspacesWhenReady();
             pushTitle();
         }, 3000);
+        loadUserCss();
         registerCachedWorkspacesWhenReady();
         pushTitle();
     }
