@@ -88,7 +88,17 @@ window.fetch = function(input, init) {
             processTelemetryBody(init.body);
         }
     }
-    return originalFetch.apply(this, arguments);
+
+    const responsePromise = originalFetch.apply(this, arguments);
+    try {
+        responsePromise.then(response => {
+            const url = (typeof input === 'string' ? input : input && input.url) || response.url || '';
+            if (isBadgeCountsUrl(url)) {
+                response.clone().text().then(text => processBadgeCountsResponse(url, text)).catch(() => {});
+            }
+        });
+    } catch (_) {}
+    return responsePromise;
 };
 
 // Intercept navigator.sendBeacon
@@ -101,11 +111,28 @@ navigator.sendBeacon = function(url, data) {
 };
 
 // Intercept XMLHttpRequest (just in case they use it for some calls)
+const originalXHROpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url) {
+    this.__zlackUrl = url;
+    return originalXHROpen.apply(this, arguments);
+};
+
 const originalXHRScan = XMLHttpRequest.prototype.send;
 XMLHttpRequest.prototype.send = function(body) {
     if (body && typeof body === 'string') {
         processTelemetryBody(body);
     }
+    try {
+        this.addEventListener('load', () => {
+            const url = this.responseURL || this.__zlackUrl || '';
+            if (!isBadgeCountsUrl(url)) return;
+            if (this.responseType === '' || this.responseType === 'text') {
+                processBadgeCountsResponse(url, this.responseText);
+            } else if (this.responseType === 'json') {
+                processBadgeCountsResponse(url, this.response);
+            }
+        });
+    } catch (_) {}
     return originalXHRScan.apply(this, arguments);
 };
 
@@ -179,69 +206,300 @@ Object.defineProperty(window, 'Notification', {
 });
 
 
-// 3.5 Unread / mention badge bridge -> native tray icon + window title
-// Slack keeps the browser tab title (document.title) in sync with unread state:
-//   - a parenthesised count "(3) ..."        -> unread DMs / @mentions (RED)
-//   - a leading bullet/asterisk "* ..."       -> other unread messages  (BLUE)
-//   - no prefix                               -> everything read
-// We watch <title> and forward a coarse state to Rust, which mirrors it onto the
-// OS window title (prefixed with "!" for DMs) and swaps the tray icon.
-// The classification is intentionally isolated here so it's easy to adjust if
-// Slack ever changes its title format.
-(function setupBadgeBridge() {
-    const UNREAD_MARKER = /^\s*[\*•●·⁕∗∘◦]+/;
-    const COUNT_MARKER = /^\s*\((\d+)\)/;
+// 3.5 Unread / mention badge bridge -> native tray icon + window title.
+// Badge state comes from Slack count snapshots and WebSocket events, not from
+// document.title. The title observer below only keeps the native window title text
+// in sync, with Slack's own unread markers stripped before Rust adds a "!" prefix.
+const BADGE_COUNTS_URL_RE = /\/api\/client\.counts\b|\/cache\/[^/]+\/users\/counts\b/i;
+const BADGE_TITLE_UNREAD_MARKER = /^\s*[\*•●·⁕∗∘◦]+/;
+const BADGE_TITLE_COUNT_MARKER = /^\s*\((\d+)\)/;
+const BADGE_STATE_PRIORITY = { none: 0, unread: 1, mention: 2 };
+const BADGE_MENTION_COUNT_KEYS = [
+    'dm_count',
+    'mention_count_display',
+    'num_mentions_display',
+    'mention_count',
+    'mentions_count',
+    'highlight_count',
+    'highlight_cnt',
+    'badge_count',
+];
+const BADGE_UNREAD_COUNT_KEYS = [
+    'unread_count_display',
+    'unread_count',
+    'unread_count_sum',
+    'unread_cnt',
+];
+const BADGE_MENTION_BOOL_KEYS = ['has_mentions', 'has_highlights', 'is_mentioned', 'mentioned'];
+const BADGE_UNREAD_BOOL_KEYS = ['unread', 'is_unread', 'has_unreads', 'has_unread'];
 
-    let lastState = null;
-    let lastTitle = null;
-    let lastCount = null;
+let badgeSelfUserId = null;
+let badgeWindowTitle = 'Zlack';
+let badgeLastSent = { state: null, title: null };
+const badgeCountSnapshots = new Map();
+const badgeRealtimeStates = new Map();
 
-    function classify(title) {
-        if (!title) return 'none';
-        if (COUNT_MARKER.test(title)) return 'mention';
-        if (UNREAD_MARKER.test(title)) return 'unread';
-        return 'none';
-    }
+function isBadgeCountsUrl(url) {
+    return BADGE_COUNTS_URL_RE.test(url || '');
+}
 
-    function cleanTitle(title) {
-        return (title || 'Zlack')
-            .replace(COUNT_MARKER, '')
-            .replace(UNREAD_MARKER, '')
-            .trim() || 'Zlack';
-    }
+function badgeCount(value) {
+    const n = typeof value === 'number' ? value : parseInt(value, 10);
+    return Number.isFinite(n) ? n : 0;
+}
 
-    function push() {
-        const raw = document.title || 'Zlack';
-        const state = classify(raw);
-        const clean = cleanTitle(raw);
-        const m = COUNT_MARKER.exec(raw);
-        const count = m ? parseInt(m[1], 10) : null;
-        if (state === lastState && clean === lastTitle && count === lastCount) return;
-        lastState = state;
-        lastTitle = clean;
-        lastCount = count;
-        try {
-            if (window.__TAURI__) {
-                window.__TAURI__.invoke('update_badge', { state: state, title: clean, count: count });
-            }
-        } catch (e) {
-            console.error('Zlack: update_badge failed', e);
+function badgeMaxCount(obj, keys) {
+    if (!obj || typeof obj !== 'object') return 0;
+    let max = 0;
+    for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+            max = Math.max(max, badgeCount(obj[key]));
         }
+    }
+    return max;
+}
+
+function badgeChannelId(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (typeof obj.channel === 'string') return obj.channel;
+    if (obj.channel && typeof obj.channel === 'object') return obj.channel.id || obj.channel.channel_id || null;
+    if (typeof obj.channel_id === 'string') return obj.channel_id;
+    if (typeof obj.id === 'string' && /^[CDG][A-Z0-9]{7,}$/.test(obj.id)) return obj.id;
+    return null;
+}
+
+function badgeTeamId(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (typeof obj.team === 'string') return obj.team;
+    if (obj.team && typeof obj.team === 'object') return obj.team.id || obj.team.team_id || null;
+    if (typeof obj.team_id === 'string') return obj.team_id;
+    if (typeof obj.id === 'string' && /^T[A-Z0-9]{7,}$/.test(obj.id)) return obj.id;
+    return null;
+}
+
+function badgeContextFromKey(key, context) {
+    const next = { ...context };
+    if (/^[CDG][A-Z0-9]{7,}$/.test(key)) next.channel = key;
+    if (/^T[A-Z0-9]{7,}$/.test(key)) next.team = key;
+    return next;
+}
+
+function badgeIsDmChannel(channel, path = '') {
+    return (!!channel && String(channel).startsWith('D')) || /(^|\.)(ims|mpims)(\.|\[|$)/i.test(path);
+}
+
+function badgeCleanTitle(title) {
+    return (title || 'Zlack')
+        .replace(BADGE_TITLE_COUNT_MARKER, '')
+        .replace(BADGE_TITLE_UNREAD_MARKER, '')
+        .replace(/^\s*!+\s*/, '')
+        .trim() || 'Zlack';
+}
+
+function badgeCurrentRoute() {
+    const m = window.location.pathname.match(/\/client\/([^/]+)(?:\/([^/?#]+))?/);
+    return m ? { team: m[1], channel: m[2] || null } : { team: null, channel: null };
+}
+
+function badgeStateFromCounts(obj, path = '', channelHint = null) {
+    if (!obj || typeof obj !== 'object') return { state: 'none', hasCounts: false };
+
+    const channel = badgeChannelId(obj) || channelHint;
+    const mentionCount = badgeMaxCount(obj, BADGE_MENTION_COUNT_KEYS);
+    const unreadCount = badgeMaxCount(obj, BADGE_UNREAD_COUNT_KEYS);
+    const hasExplicitCount = BADGE_MENTION_COUNT_KEYS
+        .concat(BADGE_UNREAD_COUNT_KEYS)
+        .some(key => Object.prototype.hasOwnProperty.call(obj, key));
+    const hasMentionBool = BADGE_MENTION_BOOL_KEYS.some(key => obj[key] === true || obj[key] === 'true');
+    const hasUnreadBool = BADGE_UNREAD_BOOL_KEYS.some(key => obj[key] === true || obj[key] === 'true');
+
+    if (mentionCount > 0 || hasMentionBool) return { state: 'mention', hasCounts: true };
+    if (unreadCount > 0 || hasUnreadBool) {
+        return {
+            state: badgeIsDmChannel(channel, path) ? 'mention' : 'unread',
+            hasCounts: true,
+        };
+    }
+    if (hasExplicitCount) return { state: 'none', hasCounts: true };
+
+    return { state: 'none', hasCounts: false };
+}
+
+function badgeAggregateState() {
+    let state = 'none';
+    for (const snapshot of badgeCountSnapshots.values()) {
+        for (const item of snapshot.values()) {
+            if (BADGE_STATE_PRIORITY[item.state] > BADGE_STATE_PRIORITY[state]) state = item.state;
+        }
+    }
+    for (const item of badgeRealtimeStates.values()) {
+        if (BADGE_STATE_PRIORITY[item.state] > BADGE_STATE_PRIORITY[state]) state = item.state;
+    }
+    return state;
+}
+
+function badgeSetRealtime(key, item) {
+    if (!key) return;
+    if (!item || item.state === 'none') badgeRealtimeStates.delete(key);
+    else badgeRealtimeStates.set(key, item);
+}
+
+function badgePush() {
+    const state = badgeAggregateState();
+    const title = badgeWindowTitle || badgeCleanTitle(document.title) || 'Zlack';
+    if (state === badgeLastSent.state && title === badgeLastSent.title) return;
+    badgeLastSent = { state, title };
+    try {
+        if (window.__TAURI__) {
+            // The taskbar overlay is a dot only, so no unread count is needed.
+            window.__TAURI__.invoke('update_badge', { state, title, count: null });
+        }
+    } catch (e) {
+        console.error('Zlack: update_badge failed', e);
+    }
+}
+
+function badgeCollectSnapshot(value, path = '', out = [], depth = 0, context = {}) {
+    if (!value || depth > 8) return out;
+    if (Array.isArray(value)) {
+        value.forEach((item, index) => badgeCollectSnapshot(item, `${path}[${index}]`, out, depth + 1, context));
+        return out;
+    }
+    if (typeof value !== 'object') return out;
+
+    const channel = badgeChannelId(value) || context.channel || null;
+    const team = badgeTeamId(value) || context.team || null;
+    const nextContext = { channel, team };
+    const countState = badgeStateFromCounts(value, path, channel);
+    if (countState.hasCounts && countState.state !== 'none') {
+        out.push({
+            key: channel ? `${team || 'team'}:${channel}` : path,
+            state: countState.state,
+        });
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+        if (child && typeof child === 'object') {
+            badgeCollectSnapshot(child, path ? `${path}.${key}` : key, out, depth + 1, badgeContextFromKey(key, nextContext));
+        }
+    }
+    return out;
+}
+
+function badgeSourceKey(url, data) {
+    const route = badgeCurrentRoute();
+    const cacheMatch = String(url || '').match(/\/cache\/([^/]+)\/users\/counts\b/i);
+    if (cacheMatch) return `users-counts:${cacheMatch[1]}`;
+    return `client-counts:${badgeTeamId(data) || route.team || window.location.hostname}`;
+}
+
+function processBadgeCountsResponse(url, textOrObject) {
+    if (!isBadgeCountsUrl(url)) return;
+    try {
+        const data = typeof textOrObject === 'string' ? JSON.parse(textOrObject) : textOrObject;
+        if (!data || typeof data !== 'object') return;
+        if (data.self && data.self.id) badgeSelfUserId = data.self.id;
+
+        const snapshot = new Map();
+        for (const item of badgeCollectSnapshot(data)) {
+            snapshot.set(item.key, { state: item.state });
+        }
+        badgeCountSnapshots.set(badgeSourceKey(url, data), snapshot);
+        badgePush();
+    } catch (_) {}
+}
+
+function badgeClearChannel(obj) {
+    const team = badgeTeamId(obj);
+    const channel = badgeChannelId(obj);
+    if (!channel) return;
+
+    badgeSetRealtime(`${team || 'team'}:${channel}`, null);
+    for (const snapshot of badgeCountSnapshots.values()) {
+        snapshot.delete(`${team || 'team'}:${channel}`);
+        for (const key of Array.from(snapshot.keys())) {
+            if (key.endsWith(`:${channel}`) || key === channel) snapshot.delete(key);
+        }
+    }
+}
+
+function badgeProcessRealtimeObject(obj, depth = 0, context = {}) {
+    if (!obj || typeof obj !== 'object' || depth > 5) return;
+    if (obj.self && obj.self.id) badgeSelfUserId = obj.self.id;
+
+    const channel = badgeChannelId(obj) || context.channel || null;
+    const team = badgeTeamId(obj) || context.team || null;
+    const nextContext = { channel, team };
+
+    if (Array.isArray(obj.clearing_data)) {
+        obj.clearing_data.forEach(badgeClearChannel);
+        badgeClearChannel({ ...obj, channel_id: channel, team_id: team });
+        badgePush();
+    }
+
+    const countState = badgeStateFromCounts(obj, 'event', channel);
+    if (countState.hasCounts) {
+        const key = channel ? `${team || 'team'}:${channel}` : `global:${team || 'team'}:${obj.type || 'counts'}`;
+        badgeSetRealtime(key, { state: countState.state });
+        badgePush();
+    }
+
+    if (obj.type === 'message' && channel) {
+        const route = badgeCurrentRoute();
+        const isVisibleChannel = document.hasFocus() && channel === route.channel && (!team || !route.team || team === route.team);
+        if (!isVisibleChannel && !obj.subtype && (!badgeSelfUserId || obj.user !== badgeSelfUserId)) {
+            const text = typeof obj.text === 'string' ? obj.text : '';
+            const mentionedSelf = badgeSelfUserId && text.includes(`<@${badgeSelfUserId}>`);
+            const state = (badgeIsDmChannel(channel) || mentionedSelf) ? 'mention' : 'unread';
+            badgeSetRealtime(`${team || 'team'}:${channel}`, { state });
+            badgePush();
+        }
+    }
+
+    for (const [key, child] of Object.entries(obj)) {
+        if (child && typeof child === 'object') {
+            badgeProcessRealtimeObject(child, depth + 1, badgeContextFromKey(key, nextContext));
+        }
+    }
+}
+
+function processBadgeSocketMessage(data) {
+    if (typeof data !== 'string') return;
+    try {
+        badgeProcessRealtimeObject(JSON.parse(data));
+    } catch (_) {}
+}
+
+(function setupBadgeBridge() {
+    if (window.WebSocket) {
+        const OriginalWebSocket = window.WebSocket;
+        window.WebSocket = function(url, protocols) {
+            const ws = protocols === undefined ? new OriginalWebSocket(url) : new OriginalWebSocket(url, protocols);
+            try {
+                ws.addEventListener('message', event => processBadgeSocketMessage(event.data));
+            } catch (_) {}
+            return ws;
+        };
+        window.WebSocket.prototype = OriginalWebSocket.prototype;
+        Object.setPrototypeOf(window.WebSocket, OriginalWebSocket);
+    }
+
+    function pushTitle() {
+        badgeWindowTitle = badgeCleanTitle(document.title || 'Zlack');
+        badgePush();
     }
 
     function start() {
         const head = document.querySelector('head');
         if (head) {
-            // subtree covers <title> being replaced by Slack's SPA, plus its text edits.
-            new MutationObserver(push).observe(head, {
+            new MutationObserver(pushTitle).observe(head, {
                 subtree: true,
                 childList: true,
                 characterData: true,
             });
         }
-        // Safety net in case the observed nodes get swapped out entirely.
-        setInterval(push, 3000);
-        push();
+        setInterval(pushTitle, 3000);
+        pushTitle();
     }
 
     if (document.readyState === 'loading') {

@@ -358,7 +358,6 @@ fn update_badge(app_handle: tauri::AppHandle, state: String, title: String, coun
     {
         let app = app_handle.clone();
         let state_for_overlay = state.clone();
-        let count_for_overlay = count;
         let _ = app_handle.run_on_main_thread(move || {
             if let Some(window) = app.get_window("main") {
                 let color = match state_for_overlay.as_str() {
@@ -366,11 +365,16 @@ fn update_badge(app_handle: tauri::AppHandle, state: String, title: String, coun
                     "unread" => Some([41u8, 120, 240]),
                     _ => None,
                 };
-                let overlay_count = if state_for_overlay == "mention" {
-                    count_for_overlay
-                } else {
-                    None
-                };
+                // Keep the overlay as a simple colored dot. The count was hard to
+                // read at taskbar size. To re-enable it, capture `count` before this
+                // closure and keep the digits small (for example, use 4/2 instead of
+                // 5/3 in draw_overlay_digits):
+                // let overlay_count = if state_for_overlay == "mention" {
+                //     count_for_overlay
+                // } else {
+                //     None
+                // };
+                let overlay_count = None;
                 set_taskbar_overlay(&window, color, overlay_count);
             }
         });
