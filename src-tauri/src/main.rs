@@ -3,7 +3,11 @@
     windows_subsystem = "windows"
 )]
 
-use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
+    sync::Mutex,
+};
 #[cfg(not(target_os = "windows"))]
 use tauri::api::notification::Notification;
 
@@ -40,11 +44,46 @@ fn load_user_css() -> Option<String> {
     exe_sibling("zlack.css").and_then(|path| std::fs::read_to_string(path).ok())
 }
 
+fn window_state_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path_resolver()
+        .app_config_dir()
+        .map(|dir| dir.join("window-state"))
+}
+
+fn load_window_maximized(app: &tauri::AppHandle) -> bool {
+    window_state_path(app)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|state| state.trim() == "maximized=true")
+        .unwrap_or(false)
+}
+
+fn save_window_maximized(app: &tauri::AppHandle, maximized: bool) {
+    if let Some(path) = window_state_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let value = if maximized {
+            "maximized=true\n"
+        } else {
+            "maximized=false\n"
+        };
+        let _ = std::fs::write(path, value);
+    }
+}
+
+fn save_window_maximized_from_window(app: &tauri::AppHandle, window: &tauri::Window) {
+    if let Ok(maximized) = window.is_maximized() {
+        save_window_maximized(app, maximized);
+    }
+}
+
 #[derive(Clone, Default)]
 struct BadgeInfo {
     state: String,
     title: String,
 }
+
+const MAX_LOADED_WORKSPACES: usize = 2;
 
 #[derive(Default)]
 struct WorkspaceState {
@@ -53,6 +92,8 @@ struct WorkspaceState {
     label_by_team: HashMap<String, String>,
     team_by_label: HashMap<String, String>,
     badges: HashMap<String, BadgeInfo>,
+    loaded_labels: VecDeque<String>,
+    closing_labels: HashSet<String>,
 }
 
 fn user_agent() -> &'static str {
@@ -100,6 +141,77 @@ fn active_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
         })
         .unwrap_or_else(|| "main".to_string());
     app.get_window(&label).or_else(|| app.get_window("main"))
+}
+
+fn touch_loaded_label(state: &mut WorkspaceState, label: &str) {
+    state.loaded_labels.retain(|existing| existing != label);
+    state.loaded_labels.push_back(label.to_string());
+}
+
+fn forget_workspace_label(state: &mut WorkspaceState, label: &str) {
+    state.loaded_labels.retain(|existing| existing != label);
+    state.closing_labels.remove(label);
+    if let Some(team) = state.team_by_label.remove(label) {
+        state.label_by_team.remove(&team);
+        state.badges.remove(&team);
+    }
+    state.badges.remove(label);
+}
+
+fn evict_loaded_workspaces(app: &tauri::AppHandle) {
+    let (labels, aggregate, title) = {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        let active_label = if state.active_label.is_empty() {
+            "main".to_string()
+        } else {
+            state.active_label.clone()
+        };
+        state
+            .loaded_labels
+            .retain(|label| app.get_window(label).is_some());
+
+        let mut labels = Vec::new();
+        while state.loaded_labels.len() > MAX_LOADED_WORKSPACES {
+            let Some(pos) = state
+                .loaded_labels
+                .iter()
+                .position(|label| label != &active_label)
+            else {
+                break;
+            };
+            let Some(label) = state.loaded_labels.remove(pos) else {
+                break;
+            };
+            state.closing_labels.insert(label.clone());
+            if let Some(team) = state.team_by_label.remove(&label) {
+                state.label_by_team.remove(&team);
+                state.badges.remove(&team);
+            }
+            state.badges.remove(&label);
+            labels.push(label);
+        }
+        let (aggregate, title) = aggregate_badge(&state);
+        (labels, aggregate, title)
+    };
+
+    for label in &labels {
+        if let Some(window) = app.get_window(label) {
+            let _ = window.close();
+        }
+    }
+    if !labels.is_empty() {
+        apply_global_badge(app, &aggregate, &title);
+    }
+}
+
+fn loaded_workspace_count(app: &tauri::AppHandle) -> usize {
+    let state = app.state::<Mutex<WorkspaceState>>();
+    let mut state = state.lock().unwrap();
+    state
+        .loaded_labels
+        .retain(|label| app.get_window(label).is_some());
+    state.loaded_labels.len()
 }
 
 fn aggregate_badge(state: &WorkspaceState) -> (String, String) {
@@ -259,6 +371,12 @@ fn ensure_workspace_window(
     {
         return None;
     }
+
+    {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        touch_loaded_label(&mut state, &label);
+    }
     Some(label)
 }
 
@@ -346,6 +464,7 @@ fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) 
         let state = app.state::<Mutex<WorkspaceState>>();
         let mut state = state.lock().unwrap();
         state.active_label = target_label.clone();
+        touch_loaded_label(&mut state, &target_label);
         if let Some(team) = state.team_by_label.get(&target_label) {
             if let Some(badge) = state.badges.get(team) {
                 state.active_title = badge.title.clone();
@@ -381,6 +500,7 @@ fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) 
     };
     apply_global_badge(app, &state, &title);
     sync_hidden_workspace_geometry(app, &target);
+    evict_loaded_workspaces(app);
 }
 
 #[tauri::command]
@@ -403,6 +523,7 @@ fn register_workspaces(
             .team_by_label
             .entry(label.clone())
             .or_insert_with(|| active_team.clone());
+        touch_loaded_label(&mut state, &label);
         if state.active_label.is_empty() {
             state.active_label = "main".to_string();
         }
@@ -414,7 +535,11 @@ fn register_workspaces(
             if active.as_ref() == Some(&team) {
                 continue;
             }
+            if loaded_workspace_count(&app) >= MAX_LOADED_WORKSPACES {
+                break;
+            }
             let _ = ensure_workspace_window(&app, &team, None);
+            evict_loaded_workspaces(&app);
         }
     });
 }
@@ -449,6 +574,10 @@ fn update_badge(
         }
 
         let label = window.label().to_string();
+        if workspace_state.closing_labels.contains(&label) {
+            return;
+        }
+        touch_loaded_label(&mut workspace_state, &label);
         let key = team
             .clone()
             .or_else(|| workspace_state.team_by_label.get(&label).cloned())
@@ -605,7 +734,12 @@ fn main() {
       }
       SystemTrayEvent::MenuItemClick { id, .. } => {
         match id.as_str() {
-          "quit" => { std::process::exit(0); }
+          "quit" => {
+            if let Some(window) = active_window(app) {
+              save_window_maximized_from_window(app, &window);
+            }
+            std::process::exit(0);
+          }
           "show" => {
             if let Some(window) = active_window(app) {
               restore_window(&window);
@@ -618,18 +752,45 @@ fn main() {
     })
     .on_window_event(|event| match event.event() {
       WindowEvent::CloseRequested { api, .. } => {
-        event.window().hide().unwrap();
-        api.prevent_close();
+        let label = event.window().label().to_string();
+        let app = event.window().app_handle();
+        let closing_for_eviction = event.window().try_state::<Mutex<WorkspaceState>>()
+          .map(|state| state.lock().unwrap().closing_labels.contains(&label))
+          .unwrap_or(false);
+        if !closing_for_eviction {
+          save_window_maximized_from_window(&app, event.window());
+          event.window().hide().unwrap();
+          api.prevent_close();
+        }
+      }
+      WindowEvent::Destroyed => {
+        let label = event.window().label().to_string();
+        if let Some(state) = event.window().try_state::<Mutex<WorkspaceState>>() {
+          forget_workspace_label(&mut state.lock().unwrap(), &label);
+        }
       }
       WindowEvent::Focused(_focused) => {}
       WindowEvent::Resized(_) | WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
         let app = event.window().app_handle();
+        let label = event.window().label().to_string();
+        let is_active = app.try_state::<Mutex<WorkspaceState>>()
+          .map(|state| {
+            let state = state.lock().unwrap();
+            let active = if state.active_label.is_empty() { "main" } else { &state.active_label };
+            active == label
+          })
+          .unwrap_or(label == "main");
+        if is_active {
+          save_window_maximized_from_window(&app, event.window());
+        }
         sync_hidden_workspace_geometry(&app, event.window());
       }
       _ => {}
     })
     .setup(|app| {
-      allow_remote_ipc_for_label(&app.handle(), "main");
+      let app_handle = app.handle();
+      let start_maximized = load_window_maximized(&app_handle);
+      allow_remote_ipc_for_label(&app_handle, "main");
       let _window = tauri::WindowBuilder::new(
         app,
         "main",
@@ -640,10 +801,15 @@ fn main() {
       .title("Zlack")
       .inner_size(1200.0, 800.0)
       .resizable(true)
+      .maximized(start_maximized)
       .initialization_script(include_str!("../preload.js"))
       .disable_file_drop_handler()
       .icon(icons::ICON_WINDOW.clone())?
       .build()?;
+      {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        touch_loaded_label(&mut state.lock().unwrap(), "main");
+      }
       icons::apply_window_icon(&_window);
       // Match the runtime-rendered 32px tray base from the start so the larger
       // bundled icon doesn't briefly flash before preload sends the first state.
