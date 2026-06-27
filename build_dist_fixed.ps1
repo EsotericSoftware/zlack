@@ -31,7 +31,7 @@ $cabUrl = $env:WEBVIEW2_FIXED_URL
 function Expand-FixedRuntime {
     param([string]$Cab)
 
-    Write-Host "📂 Extracting WebView2 fixed runtime from: $Cab"
+    Write-Host "Extracting WebView2 fixed runtime from: $Cab"
     $tmp = Join-Path $env:TEMP ("zlack-webview2-" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     try {
@@ -53,7 +53,7 @@ function Expand-FixedRuntime {
         if (Test-Path $runtimeDir) { Remove-Item -Recurse -Force $runtimeDir }
         New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
         Copy-Item -Path (Join-Path $sourceRoot "*") -Destination $runtimeDir -Recurse -Force
-        Write-Host "  ✅ Runtime extracted to $runtimeDir"
+        Write-Host "  OK Runtime extracted to $runtimeDir"
     }
     finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -62,14 +62,14 @@ function Expand-FixedRuntime {
 
 # --- 1. Ensure the fixed runtime is present ---------------------------------
 if (Test-Path $runtimeExe) {
-    Write-Host "✅ Reusing existing fixed runtime at $runtimeDir"
+    Write-Host "OK Reusing existing fixed runtime at $runtimeDir"
 }
 elseif ($CabPath -and (Test-Path $CabPath)) {
     Expand-FixedRuntime -Cab $CabPath
 }
 elseif ($cabUrl) {
     $dl = Join-Path $env:TEMP "zlack-webview2-fixed.cab"
-    Write-Host "⬇️  Downloading WebView2 fixed runtime from $cabUrl"
+    Write-Host "Downloading WebView2 fixed runtime from $cabUrl"
     Invoke-WebRequest -Uri $cabUrl -OutFile $dl
     Expand-FixedRuntime -Cab $dl
     Remove-Item -Force $dl -ErrorAction SilentlyContinue
@@ -88,7 +88,7 @@ Download page: https://developer.microsoft.com/microsoft-edge/webview2/  (Fixed 
 }
 
 # --- 2. Build with the fixed-runtime config patch --------------------------
-Write-Host "🚧 Starting Zlack Build (fixed WebView2 runtime)..."
+Write-Host "Starting Zlack Build (fixed WebView2 runtime)..."
 npm run tauri -- build --config "src-tauri/tauri.fixed.conf.json"
 if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE" }
 
@@ -98,7 +98,7 @@ if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 }
 
-Write-Host "📦 Copying artifacts to $distDir..."
+Write-Host "Copying artifacts to $distDir..."
 
 function Copy-WithSuffix {
     param([string]$Glob, [string]$Label)
@@ -106,11 +106,11 @@ function Copy-WithSuffix {
     foreach ($item in $items) {
         $name = "$($item.BaseName)_webview2fixed$($item.Extension)"
         Copy-Item $item.FullName -Destination (Join-Path $distDir $name) -Force
-        Write-Host "  ✅ $Label copied as $name"
+        Write-Host "  OK $Label copied as $name"
     }
 }
 
 Copy-WithSuffix "src-tauri/target/release/bundle/msi/*.msi" "MSI"
 Copy-WithSuffix "src-tauri/target/release/bundle/nsis/*.exe" "Setup EXE"
 
-Write-Host "✨ Fixed-runtime build complete! Artifacts are in the '$distDir' folder."
+Write-Host "Fixed-runtime build complete! Artifacts are in the '$distDir' folder."
