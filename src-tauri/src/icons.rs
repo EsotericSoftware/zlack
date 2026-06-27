@@ -139,8 +139,8 @@ fn draw_badge(img: &mut image::RgbaImage, color: [u8; 3]) {
     );
 }
 
-fn load_icon_image(size: u32) -> image::RgbaImage {
-    let img = ["zlack.png", "zlack.ico"]
+fn load_named_icon_image(size: u32, names: &[&str]) -> image::RgbaImage {
+    let img = names
         .iter()
         .filter_map(|name| exe_sibling(name))
         .find_map(|path| {
@@ -159,6 +159,15 @@ fn load_icon_image(size: u32) -> image::RgbaImage {
     } else {
         image::imageops::resize(&img, size, size, image::imageops::FilterType::Lanczos3)
     }
+}
+
+fn load_icon_image(size: u32) -> image::RgbaImage {
+    load_named_icon_image(size, &["zlack.png", "zlack.ico"])
+}
+
+#[cfg(target_os = "windows")]
+fn load_taskbar_icon_image(size: u32) -> image::RgbaImage {
+    load_named_icon_image(size, &["zlack-taskbar.png", "zlack.png", "zlack.ico"])
 }
 
 fn icon_from_image(img: image::RgbaImage) -> Icon {
@@ -186,8 +195,11 @@ fn set_windows_window_icons(window: &tauri::Window) {
     };
 
     unsafe {
-        for (size, icon_type) in [(TRAY_ICON_SIZE, ICON_SMALL), (WINDOW_ICON_SIZE, ICON_BIG)] {
-            let img = load_icon_image(size);
+        let icons = [
+            (load_icon_image(TRAY_ICON_SIZE), ICON_SMALL),
+            (load_taskbar_icon_image(WINDOW_ICON_SIZE), ICON_BIG),
+        ];
+        for (img, icon_type) in icons {
             let (w, h) = (img.width(), img.height());
             if let Some(hicon) = rgba_to_hicon(&img.into_raw(), w, h) {
                 // WM_SETICON keeps using the HICON handle; do not destroy it here.

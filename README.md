@@ -8,7 +8,7 @@
 
 *   **Native Desktop Notifications**: Integrated directly with Windows native toast notifications.
 *   **Unread Tray & Title Badges**: The tray icon shows a red badge for unread DMs/@mentions and a blue badge for other unread messages, and the window title is prefixed with `!` for unread DMs — handy if you prefer ambient indicators over toast popups.
-*   **Custom CSS & Icon**: Place `zlack.css`, `zlack.png`, or `zlack.ico` next to the executable to customize Slack's UI and Zlack's running icon.
+*   **Custom CSS & Icon**: Place `zlack.css`, `zlack.png`, `zlack.ico`, or `zlack-taskbar.png` next to the executable to customize Slack's UI and Zlack's running icons.
 *   **Private WebView2 Runtime (optional)**: On Windows, Zlack uses a private `webview2-runtime` folder next to the executable when present, otherwise it falls back to the shared system WebView2 runtime.
 *   **Smart Context**: Extracts `Team ID` and `Channel ID` from Slack's console logs to ensure notifications take you to the exact right place.
 *   **Background Reliability**: Includes a custom rust backend to ensure clicking a notification properly restores the window from the system tray and focuses it.
@@ -88,12 +88,13 @@ Place optional customization files next to `Zlack.exe`:
 
 ```text
 Zlack.exe
-zlack.css   # injected into Slack
-zlack.png   # preferred custom running icon
-zlack.ico   # fallback custom running icon
+zlack.css          # injected into Slack
+zlack.png          # preferred custom running icon
+zlack.ico          # fallback custom running icon
+zlack-taskbar.png  # optional Windows taskbar-only override
 ```
 
-The custom icon is used for the window, taskbar, and tray badge base. The embedded exe/installer icon remains fixed until rebuilt.
+The custom icon is used for the window, taskbar, and tray badge base. If `zlack-taskbar.png` exists, it overrides only the Windows taskbar icon. The embedded exe/installer icon remains fixed until rebuilt.
 
 ## 🧩 How It Works
 

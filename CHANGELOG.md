@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Customization files**: `zlack.css` next to the executable is injected into Slack, and `zlack.png` / `zlack.ico` can override the running window/taskbar/tray icon.
+- **Customization files**: `zlack.css` next to the executable is injected into Slack, `zlack.png` / `zlack.ico` can override the running window/taskbar/tray icon, and `zlack-taskbar.png` can override only the Windows taskbar icon.
 
 ## [1.2.0] - 2026-06-19
 
