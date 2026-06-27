@@ -581,6 +581,7 @@ function badgeSetRealtime(key, item) {
 }
 
 function badgePush() {
+    badgeClearCurrentVisibleChannel();
     const state = badgeAggregateState();
     const title = badgeWindowTitle || badgeCleanTitle(document.title) || 'Zlack';
     if (state === badgeLastSent.state && title === badgeLastSent.title) return;
@@ -604,9 +605,9 @@ function badgeCollectSnapshot(value, path = '', out = [], depth = 0, context = {
     const team = badgeTeamId(value) || context.team || null;
     const nextContext = { channel, team };
     const countState = badgeStateFromCounts(value, path, channel);
-    if (countState.hasCounts && countState.state !== 'none') {
+    if (channel && countState.hasCounts && countState.state !== 'none') {
         out.push({
-            key: channel ? `${team || 'team'}:${channel}` : path,
+            key: `${team || 'team'}:${channel}`,
             state: countState.state,
         });
     }
@@ -645,15 +646,36 @@ function processBadgeCountsResponse(url, textOrObject) {
 function badgeClearChannel(obj) {
     const team = badgeTeamId(obj);
     const channel = badgeChannelId(obj);
-    if (!channel) return;
+    if (!channel) return false;
 
-    badgeSetRealtime(`${team || 'team'}:${channel}`, null);
-    for (const snapshot of badgeCountSnapshots.values()) {
-        snapshot.delete(`${team || 'team'}:${channel}`);
-        for (const key of Array.from(snapshot.keys())) {
-            if (key.endsWith(`:${channel}`) || key === channel) snapshot.delete(key);
+    let changed = false;
+    if (badgeRealtimeStates.delete(`${team || 'team'}:${channel}`)) changed = true;
+    for (const key of Array.from(badgeRealtimeStates.keys())) {
+        if (key.endsWith(`:${channel}`) || key === channel) {
+            badgeRealtimeStates.delete(key);
+            changed = true;
         }
     }
+    for (const snapshot of badgeCountSnapshots.values()) {
+        if (snapshot.delete(`${team || 'team'}:${channel}`)) changed = true;
+        for (const key of Array.from(snapshot.keys())) {
+            if (key.endsWith(`:${channel}`) || key === channel) {
+                snapshot.delete(key);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+function badgeClearCurrentVisibleChannel() {
+    const route = badgeCurrentRoute();
+    if (!route.team || !route.channel || !document.hasFocus() || document.visibilityState === 'hidden') return false;
+    return badgeClearChannel({ team_id: route.team, channel_id: route.channel });
+}
+
+function badgeClearCurrentVisibleChannelAndPush() {
+    if (badgeClearCurrentVisibleChannel()) badgePush();
 }
 
 function badgeProcessRealtimeObject(obj, depth = 0, context = {}) {
@@ -671,9 +693,12 @@ function badgeProcessRealtimeObject(obj, depth = 0, context = {}) {
     }
 
     const countState = badgeStateFromCounts(obj, 'event', channel);
-    if (countState.hasCounts) {
-        const key = channel ? `${team || 'team'}:${channel}` : `global:${team || 'team'}:${obj.type || 'counts'}`;
-        badgeSetRealtime(key, { state: countState.state });
+    if (channel && countState.hasCounts) {
+        if (countState.state === 'none') {
+            badgeClearChannel({ ...obj, team_id: team, channel_id: channel });
+        } else {
+            badgeSetRealtime(`${team || 'team'}:${channel}`, { state: countState.state });
+        }
         badgePush();
     }
 
@@ -867,7 +892,13 @@ function processBadgeSocketMessage(data) {
         document.addEventListener('mouseup', maybeSwitchWorkspace, true);
         document.addEventListener('click', maybeSwitchWorkspace, true);
         document.addEventListener('keydown', maybeSwitchWorkspaceShortcut, true);
+        document.addEventListener('pointerup', badgeClearCurrentVisibleChannelAndPush, true);
+        document.addEventListener('keyup', badgeClearCurrentVisibleChannelAndPush, true);
+        document.addEventListener('visibilitychange', badgeClearCurrentVisibleChannelAndPush, true);
+        window.addEventListener('focus', badgeClearCurrentVisibleChannelAndPush, true);
+        window.addEventListener('popstate', badgeClearCurrentVisibleChannelAndPush, true);
         setInterval(() => {
+            badgeClearCurrentVisibleChannelAndPush();
             registerCachedWorkspacesWhenReady();
             pushTitle();
         }, 3000);
