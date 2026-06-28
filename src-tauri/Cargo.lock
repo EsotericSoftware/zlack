@@ -8,6 +8,8 @@ version = "1.2.0"
 dependencies = [
  "image",
  "lazy_static",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",

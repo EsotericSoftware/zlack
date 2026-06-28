@@ -11,6 +11,7 @@ use std::{
 #[cfg(not(target_os = "windows"))]
 use tauri::api::notification::Notification;
 
+use serde::Serialize;
 use tauri::{
     scope::ipc::RemoteDomainAccessScope, CustomMenuItem, Manager, PhysicalPosition, PhysicalSize,
     Position, Size, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem, WindowEvent,
@@ -83,6 +84,31 @@ struct BadgeInfo {
     title: String,
 }
 
+#[derive(Clone, Default)]
+struct WorkspaceMeta {
+    name: String,
+    icon_image: String,
+    icon_text: String,
+    icon_color: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceButtonInfo {
+    team: String,
+    active: bool,
+    badge: String,
+    name: Option<String>,
+    icon_image: Option<String>,
+    icon_text: Option<String>,
+    icon_color: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceStatus {
+    active: Option<String>,
+    workspaces: Vec<WorkspaceButtonInfo>,
+}
+
 const MAX_LOADED_WORKSPACES: usize = 2;
 
 #[derive(Default)]
@@ -92,6 +118,7 @@ struct WorkspaceState {
     label_by_team: HashMap<String, String>,
     team_by_label: HashMap<String, String>,
     badges: HashMap<String, BadgeInfo>,
+    meta_by_team: HashMap<String, WorkspaceMeta>,
     loaded_labels: VecDeque<String>,
     closing_labels: HashSet<String>,
 }
@@ -146,6 +173,25 @@ fn active_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
 fn touch_loaded_label(state: &mut WorkspaceState, label: &str) {
     state.loaded_labels.retain(|existing| existing != label);
     state.loaded_labels.push_back(label.to_string());
+}
+
+fn set_label_team(state: &mut WorkspaceState, label: &str, team: &str) {
+    if let Some(previous) = state
+        .team_by_label
+        .insert(label.to_string(), team.to_string())
+    {
+        if previous != team
+            && state
+                .label_by_team
+                .get(&previous)
+                .is_some_and(|old| old == label)
+        {
+            state.label_by_team.remove(&previous);
+        }
+    }
+    state
+        .label_by_team
+        .insert(team.to_string(), label.to_string());
 }
 
 fn forget_workspace_label(state: &mut WorkspaceState, label: &str) {
@@ -502,6 +548,135 @@ fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) 
     apply_global_badge(app, &state, &title);
     sync_hidden_workspace_geometry(app, &target);
     evict_loaded_workspaces(app);
+    emit_workspace_status(app);
+}
+
+fn trimmed_non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn build_workspace_status(state: &WorkspaceState, app: &tauri::AppHandle) -> WorkspaceStatus {
+    let active_label = if state.active_label.is_empty() {
+        "main".to_string()
+    } else {
+        state.active_label.clone()
+    };
+    let active = state.team_by_label.get(&active_label).cloned();
+
+    let mut seen = HashSet::new();
+    let mut workspaces = Vec::new();
+    for loaded_label in state.loaded_labels.iter() {
+        if state.closing_labels.contains(loaded_label) || app.get_window(loaded_label).is_none() {
+            continue;
+        }
+        let Some(team) = state.team_by_label.get(loaded_label).cloned() else {
+            continue;
+        };
+        if !seen.insert(team.clone()) {
+            continue;
+        }
+        let badge = state
+            .badges
+            .get(&team)
+            .or_else(|| state.badges.get(loaded_label))
+            .map(|badge| badge.state.clone())
+            .unwrap_or_else(|| "none".to_string());
+        let meta = state.meta_by_team.get(&team).cloned().unwrap_or_default();
+        workspaces.push(WorkspaceButtonInfo {
+            active: active.as_ref() == Some(&team) || loaded_label == &active_label,
+            team,
+            badge,
+            name: trimmed_non_empty(Some(meta.name)),
+            icon_image: trimmed_non_empty(Some(meta.icon_image)),
+            icon_text: trimmed_non_empty(Some(meta.icon_text)),
+            icon_color: trimmed_non_empty(Some(meta.icon_color)),
+        });
+    }
+
+    WorkspaceStatus { active, workspaces }
+}
+
+fn emit_workspace_status(app: &tauri::AppHandle) {
+    let status = {
+        let state = app.state::<Mutex<WorkspaceState>>();
+        let state = state.lock().unwrap();
+        build_workspace_status(&state, app)
+    };
+
+    if let (Some(window), Ok(json)) = (active_window(app), serde_json::to_string(&status)) {
+        let js = format!(
+            "window.__ZlackWorkspaceStatus && window.__ZlackWorkspaceStatus({});",
+            json
+        );
+        let _ = window.eval(&js);
+    }
+}
+
+#[tauri::command]
+fn update_workspace_meta(
+    window: tauri::Window,
+    app_handle: tauri::AppHandle,
+    team: Option<String>,
+    name: Option<String>,
+    icon_image: Option<String>,
+    icon_text: Option<String>,
+    icon_color: Option<String>,
+) {
+    let label = window.label().to_string();
+    {
+        let state = app_handle.state::<Mutex<WorkspaceState>>();
+        let mut state = state.lock().unwrap();
+        let Some(team) =
+            trimmed_non_empty(team).or_else(|| state.team_by_label.get(&label).cloned())
+        else {
+            return;
+        };
+
+        set_label_team(&mut state, &label, &team);
+
+        let meta = state.meta_by_team.entry(team).or_default();
+        if let Some(value) = trimmed_non_empty(name) {
+            meta.name = value;
+        }
+        if let Some(value) = trimmed_non_empty(icon_image) {
+            meta.icon_image = value;
+        }
+        if let Some(value) = trimmed_non_empty(icon_text) {
+            meta.icon_text = value;
+        }
+        if let Some(value) = trimmed_non_empty(icon_color) {
+            meta.icon_color = value;
+        }
+    }
+    emit_workspace_status(&app_handle);
+}
+
+#[tauri::command]
+fn workspace_status(
+    window: tauri::Window,
+    app_handle: tauri::AppHandle,
+    current: Option<String>,
+) -> WorkspaceStatus {
+    let label = window.label().to_string();
+    let state = app_handle.state::<Mutex<WorkspaceState>>();
+    let mut state = state.lock().unwrap();
+
+    if let Some(current) = trimmed_non_empty(current) {
+        set_label_team(&mut state, &label, &current);
+    }
+
+    state
+        .loaded_labels
+        .retain(|label| app_handle.get_window(label).is_some());
+
+    build_workspace_status(&state, &app_handle)
 }
 
 #[tauri::command]
@@ -516,19 +691,13 @@ fn register_workspaces(
     if let Some(active_team) = active.as_ref() {
         let state = app_handle.state::<Mutex<WorkspaceState>>();
         let mut state = state.lock().unwrap();
-        state
-            .label_by_team
-            .entry(active_team.clone())
-            .or_insert_with(|| label.clone());
-        state
-            .team_by_label
-            .entry(label.clone())
-            .or_insert_with(|| active_team.clone());
+        set_label_team(&mut state, &label, active_team);
         touch_loaded_label(&mut state, &label);
         if state.active_label.is_empty() {
             state.active_label = "main".to_string();
         }
     }
+    emit_workspace_status(&app_handle);
 
     let app = app_handle.clone();
     std::thread::spawn(move || {
@@ -541,6 +710,7 @@ fn register_workspaces(
             }
             let _ = ensure_workspace_window(&app, &team, None);
             evict_loaded_workspaces(&app);
+            emit_workspace_status(&app);
         }
     });
 }
@@ -584,14 +754,7 @@ fn update_badge(
             .or_else(|| workspace_state.team_by_label.get(&label).cloned())
             .unwrap_or_else(|| label.clone());
         if let Some(team) = team {
-            workspace_state
-                .label_by_team
-                .entry(team.clone())
-                .or_insert_with(|| label.clone());
-            workspace_state
-                .team_by_label
-                .entry(label.clone())
-                .or_insert(team);
+            set_label_team(&mut workspace_state, &label, &team);
         }
 
         workspace_state.badges.insert(
@@ -608,6 +771,7 @@ fn update_badge(
     };
 
     apply_global_badge(&app_handle, &aggregate, &active_title);
+    emit_workspace_status(&app_handle);
 }
 
 #[tauri::command]
@@ -766,9 +930,11 @@ fn main() {
       }
       WindowEvent::Destroyed => {
         let label = event.window().label().to_string();
+        let app = event.window().app_handle();
         if let Some(state) = event.window().try_state::<Mutex<WorkspaceState>>() {
           forget_workspace_label(&mut state.lock().unwrap(), &label);
         }
+        emit_workspace_status(&app);
       }
       WindowEvent::Focused(_focused) => {}
       WindowEvent::Resized(_) | WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -821,6 +987,8 @@ fn main() {
       notify,
       load_user_css,
       update_badge,
+      update_workspace_meta,
+      workspace_status,
       register_workspaces,
       switch_workspace
     ])

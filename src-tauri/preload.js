@@ -266,6 +266,10 @@ let didRegisterCachedWorkspaces = false;
 let workspaceOrder = [];
 let badgeLastCountsRequest = null;
 let badgeCountsPollInFlight = false;
+let workspaceButtonsStatus = { active: null, workspaces: [] };
+let workspaceButtonsRequestInFlight = false;
+let workspaceButtonsRenderScheduled = false;
+let workspaceMetaLastSent = '';
 const badgeCountSnapshots = new Map();
 const badgeRealtimeStates = new Map();
 const workspaceTeamByDomain = new Map();
@@ -661,6 +665,9 @@ function badgePush() {
     if (state === badgeLastSent.state && title === badgeLastSent.title) return;
     badgeLastSent = { state, title };
     try {
+        window.dispatchEvent(new Event('zlack-badge-state-changed'));
+    } catch (_) {}
+    try {
         // The taskbar overlay is a dot only, so no unread count is needed.
         const team = badgeCurrentRoute().team;
         tauriInvoke('update_badge', { state, title, count: null, team }).catch(() => {});
@@ -842,6 +849,224 @@ function processBadgeSocketMessage(data) {
         return el && el.closest ? el.closest(selector) : null;
     }
 
+    function findNativeWorkspaceButton() {
+        return Array.from(document.querySelectorAll('button.p-account_switcher[data-qa="account_switcher_team_icon"], button[data-qa="account_switcher_team_icon"]'))
+            .find(button => !button.closest('#zlack-workspace-switcher')) || null;
+    }
+
+    function workspaceFallbackName(team) {
+        return team || 'Workspace';
+    }
+
+    function workspaceInitials(name, team) {
+        const text = String(name || '').trim();
+        if (text) {
+            const initials = text.split(/\s+/).map(part => part[0]).join('').slice(0, 2).toUpperCase();
+            if (initials) return initials;
+        }
+        return String(team || '?').replace(/^T/, '').slice(0, 2).toUpperCase() || '?';
+    }
+
+    function workspaceNameFromNativeButton(button, iconEl) {
+        let name = iconEl?.getAttribute('aria-label') || '';
+        if (!name) {
+            const label = button?.getAttribute('aria-label') || '';
+            const match = label.match(/\(([^()]+)\)\s*$/);
+            name = match ? match[1] : label.replace(/^Switch workspaces…?\s*/i, '').trim();
+        }
+        return name || '';
+    }
+
+    function currentWorkspaceMeta() {
+        const team = badgeCurrentRoute().team;
+        const button = findNativeWorkspaceButton();
+        if (!team || !button) return null;
+        const iconEl = button.querySelector('[data-qa="team-icon"], .c-team_icon');
+        const computed = iconEl ? window.getComputedStyle(iconEl) : null;
+        const name = workspaceNameFromNativeButton(button, iconEl);
+        const backgroundImage = (iconEl?.style?.backgroundImage || computed?.backgroundImage || '').trim();
+        const backgroundColor = (iconEl?.style?.backgroundColor || computed?.backgroundColor || '').trim();
+        const iconText = (iconEl?.textContent || '').trim() || workspaceInitials(name, team);
+        return {
+            team,
+            name,
+            iconImage: backgroundImage && backgroundImage !== 'none' ? backgroundImage : '',
+            iconText,
+            iconColor: backgroundColor && !/^rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)$/i.test(backgroundColor) ? backgroundColor : '',
+        };
+    }
+
+    function sendCurrentWorkspaceMeta() {
+        const meta = currentWorkspaceMeta();
+        if (!meta) return;
+        const serialized = JSON.stringify(meta);
+        if (serialized === workspaceMetaLastSent) return;
+        workspaceMetaLastSent = serialized;
+        tauriInvoke('update_workspace_meta', {
+            team: meta.team,
+            name: meta.name,
+            iconImage: meta.iconImage,
+            iconText: meta.iconText,
+            iconColor: meta.iconColor,
+        }).catch(() => {});
+    }
+
+    function workspaceInfoByTeam(team) {
+        const workspaces = Array.isArray(workspaceButtonsStatus?.workspaces) ? workspaceButtonsStatus.workspaces : [];
+        return workspaces.find(item => item && item.team === team) || null;
+    }
+
+    function workspaceBadgeState(team) {
+        const statusBadge = workspaceInfoByTeam(team)?.badge || 'none';
+        if (team === badgeCurrentRoute().team) {
+            const localBadge = badgeAggregateState();
+            return localBadge !== 'none' ? localBadge : statusBadge;
+        }
+        return statusBadge;
+    }
+
+    function setWorkspaceBadge(button, state) {
+        button.style.setProperty('position', 'relative', 'important');
+        let badge = button.querySelector(':scope > .zlack-workspace-badge');
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'zlack-workspace-badge';
+            badge.setAttribute('aria-hidden', 'true');
+            button.appendChild(badge);
+        }
+        Object.assign(badge.style, {
+            display: state === 'mention' || state === 'unread' ? 'block' : 'none',
+            position: 'absolute',
+            top: '3px',
+            right: '3px',
+            width: '11px',
+            height: '11px',
+            borderRadius: '999px',
+            border: '2px solid var(--sk_primary_background, #1a1d21)',
+            background: state === 'mention' ? '#e01e5a' : '#36c5f0',
+            zIndex: '2',
+            pointerEvents: 'none',
+        });
+    }
+
+    function applyWorkspaceIcon(button, info) {
+        let icon = button.querySelector('.zlack-workspace-team-icon');
+        if (!icon) {
+            icon = document.createElement('i');
+            icon.className = 'c-team_icon p-account_switcher__team_icon zlack-workspace-team-icon';
+            icon.setAttribute('role', 'img');
+            icon.setAttribute('aria-hidden', 'true');
+            icon.setAttribute('data-qa', 'team-icon');
+            button.appendChild(icon);
+        }
+        const name = info.name || workspaceFallbackName(info.team);
+        const iconImage = info.icon_image || info.iconImage || '';
+        icon.setAttribute('aria-label', name);
+        Object.assign(icon.style, {
+            height: '36px',
+            width: '36px',
+            minWidth: '36px',
+            fontSize: '18px',
+            lineHeight: '36px',
+            textAlign: 'center',
+            whiteSpace: 'nowrap',
+            backgroundImage: iconImage || '',
+            backgroundColor: info.icon_color || info.iconColor || '',
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
+        });
+        icon.textContent = iconImage ? '' : (info.icon_text || info.iconText || workspaceInitials(name, info.team));
+    }
+
+    function renderWorkspaceButtons() {
+        const currentTeam = badgeCurrentRoute().team;
+        const nativeButton = findNativeWorkspaceButton();
+        if (!currentTeam || !nativeButton) return;
+
+        const currentInfo = workspaceInfoByTeam(currentTeam) || currentWorkspaceMeta() || { team: currentTeam };
+        const currentName = currentInfo.name || workspaceNameFromNativeButton(nativeButton, nativeButton.querySelector('[data-qa="team-icon"], .c-team_icon')) || workspaceFallbackName(currentTeam);
+        nativeButton.classList.add('zlack-workspace-native-button');
+        nativeButton.title = currentName;
+        setWorkspaceBadge(nativeButton, workspaceBadgeState(currentTeam));
+
+        const trigger = nativeButton.closest('.p-peek_trigger') || nativeButton.parentElement;
+        if (!trigger || !trigger.parentElement) return;
+        let container = document.getElementById('zlack-workspace-switcher');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'zlack-workspace-switcher';
+            container.setAttribute('role', 'none');
+        }
+        container.style.display = 'contents';
+        if (container.parentElement !== trigger.parentElement || container.previousElementSibling !== trigger) {
+            trigger.after(container);
+        }
+
+        container.textContent = '';
+        const workspaces = Array.isArray(workspaceButtonsStatus?.workspaces) ? workspaceButtonsStatus.workspaces : [];
+        for (const info of workspaces) {
+            if (!info || !info.team || info.team === currentTeam) continue;
+            const name = info.name || workspaceFallbackName(info.team);
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'c-button-unstyled p-account_switcher zlack-workspace-native-button';
+            button.dataset.zlackWorkspaceTeam = info.team;
+            button.setAttribute('aria-label', name);
+            button.title = name;
+            applyWorkspaceIcon(button, info);
+            setWorkspaceBadge(button, info.badge || 'none');
+            container.appendChild(button);
+        }
+    }
+
+    function scheduleWorkspaceButtonsRender() {
+        if (workspaceButtonsRenderScheduled) return;
+        workspaceButtonsRenderScheduled = true;
+        requestAnimationFrame(() => {
+            workspaceButtonsRenderScheduled = false;
+            sendCurrentWorkspaceMeta();
+            renderWorkspaceButtons();
+        });
+    }
+
+    function applyWorkspaceStatus(status) {
+        if (status && Array.isArray(status.workspaces)) workspaceButtonsStatus = status;
+        scheduleWorkspaceButtonsRender();
+    }
+
+    function requestWorkspaceButtonStatus() {
+        sendCurrentWorkspaceMeta();
+        renderWorkspaceButtons();
+        if (workspaceButtonsRequestInFlight) return;
+        workspaceButtonsRequestInFlight = true;
+        tauriInvoke('workspace_status', { current: badgeCurrentRoute().team }, 3000)
+            .then(applyWorkspaceStatus)
+            .catch(() => {})
+            .finally(() => { workspaceButtonsRequestInFlight = false; });
+    }
+
+    function maybeHandleWorkspaceButtonEvent(event) {
+        const button = closestFromEventTarget(event.target, '#zlack-workspace-switcher button[data-zlack-workspace-team]');
+        if (!button) return;
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        if (!['pointerup', 'mouseup', 'click'].includes(event.type)) return;
+        const team = button.dataset.zlackWorkspaceTeam;
+        const currentTeam = badgeCurrentRoute().team;
+        if (!team || !currentTeam || team === currentTeam) return;
+
+        const now = Date.now();
+        if (lastWorkspaceSwitch.team === team && now - lastWorkspaceSwitch.ts < 750) return;
+        lastWorkspaceSwitch = { team, ts: now };
+        closeWorkspaceSwitcherPopover();
+        tauriInvoke('switch_workspace', { team, url: null }).catch(() => {});
+    }
+
+    window.__ZlackWorkspaceStatus = applyWorkspaceStatus;
+    window.addEventListener('zlack-badge-state-changed', scheduleWorkspaceButtonsRender);
+
     function switchInfoFromSwitcherButton(target) {
         const button = closestFromEventTarget(target, 'button.p-team_switcher_menu__item, button[class*="team_switcher"], button[role="menuitemradio"]');
         if (!button) return null;
@@ -977,6 +1202,26 @@ function processBadgeSocketMessage(data) {
                 characterData: true,
             });
         }
+        const workspaceObserverRoot = document.body || document.documentElement;
+        if (workspaceObserverRoot) {
+            const nativeButtonSelector = 'button.p-account_switcher[data-qa="account_switcher_team_icon"], button[data-qa="account_switcher_team_icon"]';
+            new MutationObserver(records => {
+                const changedWorkspaceButton = records.some(record => {
+                    const target = record.target;
+                    if (target && target.closest && target.closest('#zlack-workspace-switcher')) return false;
+                    return Array.from(record.addedNodes).concat(Array.from(record.removedNodes)).some(node => {
+                        if (!node || node.nodeType !== 1) return false;
+                        return node.matches?.(nativeButtonSelector) || node.querySelector?.(nativeButtonSelector);
+                    });
+                });
+                if (changedWorkspaceButton) scheduleWorkspaceButtonsRender();
+            }).observe(workspaceObserverRoot, { childList: true, subtree: true });
+        }
+        document.addEventListener('pointerdown', maybeHandleWorkspaceButtonEvent, true);
+        document.addEventListener('mousedown', maybeHandleWorkspaceButtonEvent, true);
+        document.addEventListener('pointerup', maybeHandleWorkspaceButtonEvent, true);
+        document.addEventListener('mouseup', maybeHandleWorkspaceButtonEvent, true);
+        document.addEventListener('click', maybeHandleWorkspaceButtonEvent, true);
         document.addEventListener('pointerdown', maybeSwitchWorkspace, true);
         document.addEventListener('mousedown', maybeSwitchWorkspace, true);
         document.addEventListener('mouseup', maybeSwitchWorkspace, true);
@@ -995,6 +1240,7 @@ function processBadgeSocketMessage(data) {
         setInterval(pollBadgeCounts, BADGE_COUNTS_POLL_MS);
         loadUserCss();
         registerCachedWorkspacesWhenReady();
+        requestWorkspaceButtonStatus();
         pushTitle();
     }
 
