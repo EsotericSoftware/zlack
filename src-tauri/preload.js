@@ -93,6 +93,12 @@ window.fetch = function(input, init) {
         responsePromise.then(response => {
             const url = (typeof input === 'string' ? input : input && input.url) || response.url || '';
             if (isBadgeCountsUrl(url)) {
+                rememberBadgeCountsRequest(
+                    url,
+                    (init && init.method) || (input && input.method) || 'GET',
+                    init && init.body,
+                    (init && init.headers) || (input && input.headers)
+                );
                 response.clone().text().then(text => processBadgeCountsResponse(url, text)).catch(() => {});
             } else if (isWorkspaceInitUrl(url)) {
                 response.clone().text().then(text => processWorkspaceInitResponse(url, text)).catch(() => {});
@@ -114,8 +120,19 @@ navigator.sendBeacon = function(url, data) {
 // Intercept XMLHttpRequest (just in case they use it for some calls)
 const originalXHROpen = XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open = function(method, url) {
+    this.__zlackMethod = method;
     this.__zlackUrl = url;
+    this.__zlackHeaders = {};
     return originalXHROpen.apply(this, arguments);
+};
+
+const originalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+    try {
+        if (!this.__zlackHeaders) this.__zlackHeaders = {};
+        this.__zlackHeaders[header] = value;
+    } catch (_) {}
+    return originalXHRSetRequestHeader.apply(this, arguments);
 };
 
 const originalXHRScan = XMLHttpRequest.prototype.send;
@@ -124,6 +141,10 @@ XMLHttpRequest.prototype.send = function(body) {
         processTelemetryBody(body);
     }
     try {
+        const requestUrl = this.__zlackUrl || '';
+        if (isBadgeCountsUrl(requestUrl)) {
+            rememberBadgeCountsRequest(requestUrl, this.__zlackMethod || 'GET', body, this.__zlackHeaders);
+        }
         this.addEventListener('load', () => {
             const url = this.responseURL || this.__zlackUrl || '';
             if (!isBadgeCountsUrl(url) && !isWorkspaceInitUrl(url)) return;
@@ -217,6 +238,7 @@ const WORKSPACE_CACHE_KEY = 'ZLACK_WORKSPACES';
 const BADGE_TITLE_UNREAD_MARKER = /^\s*[\*•●·⁕∗∘◦]+/;
 const BADGE_TITLE_COUNT_MARKER = /^\s*\((\d+)\)/;
 const BADGE_STATE_PRIORITY = { none: 0, unread: 1, mention: 2 };
+const BADGE_COUNTS_POLL_MS = 30000;
 const BADGE_MENTION_COUNT_KEYS = [
     'dm_count',
     'mention_count_display',
@@ -242,6 +264,8 @@ let badgeLastSent = { state: null, title: null };
 let lastWorkspaceSwitch = { team: null, ts: 0 };
 let didRegisterCachedWorkspaces = false;
 let workspaceOrder = [];
+let badgeLastCountsRequest = null;
+let badgeCountsPollInFlight = false;
 const badgeCountSnapshots = new Map();
 const badgeRealtimeStates = new Map();
 const workspaceTeamByDomain = new Map();
@@ -398,6 +422,56 @@ function isBadgeCountsUrl(url) {
 
 function isWorkspaceInitUrl(url) {
     return WORKSPACE_INIT_URL_RE.test(url || '');
+}
+
+function badgeHeadersObject(headers) {
+    const out = {};
+    try {
+        if (!headers) return out;
+        if (headers instanceof Headers) {
+            headers.forEach((value, key) => { out[key] = value; });
+        } else if (Array.isArray(headers)) {
+            headers.forEach(([key, value]) => { out[key] = value; });
+        } else if (typeof headers === 'object') {
+            Object.assign(out, headers);
+        }
+    } catch (_) {}
+    return out;
+}
+
+function rememberBadgeCountsRequest(url, method = 'GET', body = null, headers = null) {
+    if (!isBadgeCountsUrl(url)) return;
+    try {
+        const normalizedMethod = String(method || 'GET').toUpperCase();
+        const normalizedBody = body instanceof URLSearchParams ? body.toString() : body;
+        if (normalizedMethod !== 'GET' && typeof normalizedBody !== 'string') return;
+        badgeLastCountsRequest = {
+            url: new URL(url, window.location.href).href,
+            method: normalizedMethod,
+            body: normalizedMethod === 'GET' ? null : normalizedBody,
+            headers: badgeHeadersObject(headers),
+        };
+    } catch (_) {}
+}
+
+function pollBadgeCounts() {
+    if (!badgeLastCountsRequest || badgeCountsPollInFlight) return;
+    const request = badgeLastCountsRequest;
+    badgeCountsPollInFlight = true;
+
+    const init = {
+        method: request.method,
+        credentials: 'include',
+        cache: 'no-store',
+        headers: request.headers,
+    };
+    if (request.method !== 'GET') init.body = request.body;
+
+    originalFetch(request.url, init)
+        .then(response => response.text())
+        .then(text => processBadgeCountsResponse(request.url, text))
+        .catch(() => {})
+        .finally(() => { badgeCountsPollInFlight = false; });
 }
 
 function badgeCount(value) {
@@ -918,6 +992,7 @@ function processBadgeSocketMessage(data) {
             registerCachedWorkspacesWhenReady();
             pushTitle();
         }, 3000);
+        setInterval(pollBadgeCounts, BADGE_COUNTS_POLL_MS);
         loadUserCss();
         registerCachedWorkspacesWhenReady();
         pushTitle();
