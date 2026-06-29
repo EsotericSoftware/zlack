@@ -763,6 +763,11 @@ function badgeProcessRealtimeObject(obj, depth = 0, context = {}) {
     if (!obj || typeof obj !== 'object' || depth > 5) return;
     if (obj.self && obj.self.id) badgeSelfUserId = obj.self.id;
 
+    // Reaction events include an `item` that looks like a message reference
+    // (`{ type: 'message', channel, ts }`). Don't treat that reference as a
+    // new unread message.
+    if (obj.type === 'reaction_added' || obj.type === 'reaction_removed') return;
+
     const channel = badgeChannelId(obj) || context.channel || null;
     const team = badgeTeamId(obj) || context.team || null;
     const nextContext = { channel, team };
