@@ -3,41 +3,24 @@
     windows_subsystem = "windows"
 )]
 
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Mutex,
 };
-#[cfg(not(target_os = "windows"))]
-use tauri::api::notification::Notification;
-
-use serde::Serialize;
 use tauri::{
     scope::ipc::RemoteDomainAccessScope, CustomMenuItem, Manager, PhysicalPosition, PhysicalSize,
     Position, Size, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem, WindowEvent,
 };
 
-#[cfg(target_os = "windows")]
-use tauri_winrt_notification::{Duration, Sound, Toast};
-
 mod icons;
+mod platform;
 
 pub(crate) fn exe_sibling(name: &str) -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
-}
-
-#[cfg(target_os = "windows")]
-fn prefer_private_webview2_runtime() {
-    if std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some() {
-        return;
-    }
-    if let Some(runtime) = exe_sibling("webview2-runtime") {
-        if runtime.join("msedgewebview2.exe").is_file() {
-            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", runtime);
-        }
-    }
 }
 
 #[tauri::command]
@@ -378,6 +361,7 @@ fn create_workspace_window(
     .disable_file_drop_handler()
     .icon(icons::ICON_WINDOW.clone())?
     .build()?;
+    platform::set_default_download_folder(&window);
     icons::apply_window_icon(&window);
     let _ = window.set_skip_taskbar(!visible);
     if !visible {
@@ -774,74 +758,6 @@ fn update_badge(
     emit_workspace_status(&app_handle);
 }
 
-#[tauri::command]
-fn notify(
-    app_handle: tauri::AppHandle,
-    title: String,
-    body: String,
-    team_id: Option<String>,
-    channel_id: Option<String>,
-) {
-    // Construct navigation URL if possible
-    let mut target_url = None;
-    if let (Some(tid), Some(cid)) = (&team_id, &channel_id) {
-        if tid != "unknown" && cid != "unknown" {
-            target_url = Some(format!("https://app.slack.com/client/{}/{}", tid, cid));
-        } else if tid != "unknown" {
-            target_url = Some(format!("https://app.slack.com/client/{}", tid));
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let app_handle_clone = app_handle.clone();
-        let identifier = app_handle.config().tauri.bundle.identifier.clone();
-        let target_url_clone = target_url.clone();
-
-        // EXECUTE ON MAIN THREAD:
-        // We create the toast on the main thread to ensure the COM apartment/listener
-        // stays alive for the duration of the app, rather than dying with a background thread.
-        let _ = app_handle.run_on_main_thread(move || {
-            let res = Toast::new(&identifier)
-                .title(&title)
-                .text1(&body)
-                .sound(Some(Sound::SMS))
-                .duration(Duration::Short)
-                .on_activated(move |_| {
-                    // Use robust independent clones to avoid borrow errors
-                    let app_dispatcher = app_handle_clone.clone();
-                    let app_worker = app_handle_clone.clone();
-                    let url_to_open = target_url_clone.clone();
-                    let team_to_open = team_id.clone();
-
-                    // Dispatch to Main Thread again to perform window operations
-                    let _ = app_dispatcher.run_on_main_thread(move || {
-                        if let Some(team) = team_to_open.filter(|team| team != "unknown") {
-                            switch_to_workspace(&app_worker, &team, url_to_open);
-                        } else if let Some(window) = active_window(&app_worker) {
-                            restore_window(&window);
-                        }
-                    });
-                    Ok(())
-                })
-                .show();
-
-            if let Err(e) = res {
-                eprintln!("Zlack: Failed to show toast: {}", e);
-            }
-        });
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let identifier = app_handle.config().tauri.bundle.identifier.clone();
-        let _ = Notification::new(&identifier)
-            .title(title)
-            .body(body)
-            .show();
-    }
-}
-
 // Helper: robustly restore window on Windows and macOS
 fn restore_window(window: &tauri::Window) {
     // 1. Unminimize (Restore geometry)
@@ -869,8 +785,7 @@ fn restore_window(window: &tauri::Window) {
 }
 
 fn main() {
-    #[cfg(target_os = "windows")]
-    prefer_private_webview2_runtime();
+    platform::prefer_private_webview2_runtime();
 
     let quit = CustomMenuItem::new("quit".to_string(), "Quit Zlack");
     let show = CustomMenuItem::new("show".to_string(), "Show Zlack");
@@ -973,6 +888,7 @@ fn main() {
       .disable_file_drop_handler()
       .icon(icons::ICON_WINDOW.clone())?
       .build()?;
+      platform::set_default_download_folder(&_window);
       {
         let state = app.state::<Mutex<WorkspaceState>>();
         touch_loaded_label(&mut state.lock().unwrap(), "main");
@@ -984,7 +900,7 @@ fn main() {
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
-      notify,
+      platform::notify,
       load_user_css,
       update_badge,
       update_workspace_meta,
