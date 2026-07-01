@@ -1257,30 +1257,154 @@ function processBadgeSocketMessage(data) {
 })();
 
 
-// 4. Intercept External Links
+// 4. Intercept links/new windows.
+// External links still open in the OS browser. Slack app/permalink links that
+// Slack marks as a new tab are retargeted to this WebView so Slack's own router
+// can handle them without a full app reload when possible.
+const ZLACK_SLACK_HOST_RE = /(^|\.)slack\.com$/i;
+
+function zlackUrl(href) {
+    try {
+        return new URL(href, window.location.href);
+    } catch (_) {
+        return null;
+    }
+}
+
+function zlackIsHttpUrl(url) {
+    return url && (url.protocol === 'http:' || url.protocol === 'https:');
+}
+
+function zlackIsSlackUrl(url) {
+    return zlackIsHttpUrl(url) && ZLACK_SLACK_HOST_RE.test(url.hostname || '');
+}
+
+function zlackIsSlackAppPath(pathname) {
+    return /^\/(?:client|archives)(?:\/|$)/i.test(pathname || '');
+}
+
+function zlackTeamForSlackUrl(url) {
+    const queryTeam = url.searchParams.get('team') || url.searchParams.get('team_id');
+    if (/^T[A-Z0-9]{7,}$/.test(queryTeam || '')) return queryTeam;
+
+    const clientMatch = url.pathname.match(/^\/client\/([^/?#]+)/i);
+    if (/^T[A-Z0-9]{7,}$/.test(clientMatch?.[1] || '')) return clientMatch[1];
+
+    const domain = normalizeWorkspaceDomain(url.hostname);
+    return workspaceTeamByDomain.get(domain) || badgeCurrentRoute().team || null;
+}
+
+function zlackSlackAppHref(href) {
+    const url = zlackUrl(href);
+    if (!zlackIsSlackUrl(url) || !zlackIsSlackAppPath(url.pathname)) return null;
+
+    if (/^\/client(?:\/|$)/i.test(url.pathname)) return url.href;
+
+    const team = zlackTeamForSlackUrl(url);
+    const archiveMessageMatch = url.pathname.match(/^\/archives\/([^/?#]+)\/p(\d{10})(\d{6})/i);
+    if (archiveMessageMatch && team) {
+        const channel = archiveMessageMatch[1];
+        const ts = `${archiveMessageMatch[2]}${archiveMessageMatch[3]}`;
+        const appUrl = new URL(`https://app.slack.com/client/${encodeURIComponent(team)}/${encodeURIComponent(channel)}/thread/${encodeURIComponent(channel)}-p${ts}`);
+        appUrl.search = url.search;
+        appUrl.hash = url.hash;
+        return appUrl.href;
+    }
+
+    const archiveChannelMatch = url.pathname.match(/^\/archives\/([^/?#]+)/i);
+    if (archiveChannelMatch && team) {
+        const channel = archiveChannelMatch[1];
+        const appUrl = new URL(`https://app.slack.com/client/${encodeURIComponent(team)}/${encodeURIComponent(channel)}`);
+        appUrl.search = url.search;
+        appUrl.hash = url.hash;
+        return appUrl.href;
+    }
+
+    return url.href;
+}
+
+function zlackRetargetSlackAnchor(anchor) {
+    const appHref = zlackSlackAppHref(anchor.href);
+    if (!appHref) return false;
+
+    const oldHref = anchor.getAttribute('href');
+    const oldTarget = anchor.getAttribute('target');
+    anchor.setAttribute('href', appHref);
+    anchor.removeAttribute('target');
+
+    setTimeout(() => {
+        if (oldHref == null) anchor.removeAttribute('href');
+        else anchor.setAttribute('href', oldHref);
+        if (oldTarget == null) anchor.removeAttribute('target');
+        else anchor.setAttribute('target', oldTarget);
+    }, 0);
+
+    return true;
+}
+
+function zlackOpenSlackUrlInCurrentWindow(href) {
+    const appHref = zlackSlackAppHref(href);
+    if (!appHref) return false;
+
+    const anchor = document.createElement('a');
+    anchor.href = appHref;
+    anchor.style.display = 'none';
+    anchor.setAttribute('data-zlack-synthetic-link', 'true');
+    (document.body || document.documentElement).appendChild(anchor);
+
+    const event = new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+    });
+    const notCanceled = anchor.dispatchEvent(event);
+    anchor.remove();
+
+    if (notCanceled && !event.defaultPrevented && window.location.href !== appHref) {
+        window.location.href = appHref;
+    }
+    return true;
+}
+
+window.__ZlackNavigateSlackUrl = zlackOpenSlackUrlInCurrentWindow;
+
+const originalWindowOpen = window.open;
+window.open = function(url, target, features) {
+    const href = typeof url === 'string' ? url : (url && String(url));
+    const parsed = href ? zlackUrl(href) : null;
+
+    if (zlackSlackAppHref(href)) {
+        zlackOpenSlackUrlInCurrentWindow(href);
+        return null;
+    }
+
+    if (zlackIsHttpUrl(parsed) && !zlackIsSlackUrl(parsed)) {
+        if (window.__TAURI__) window.__TAURI__.shell.open(parsed.href);
+        return null;
+    }
+
+    return originalWindowOpen.apply(this, arguments);
+};
+
 document.addEventListener('click', (e) => {
-    const target = e.target.closest('a');
-    if (target && target.href) {
-        // Check if it's an external link (http/https) and NOT part of the Slack app itself
-        const href = target.href;
-        const isExternal = href.startsWith('http') && 
-                           !href.includes('app.slack.com') && 
-                           !href.includes('slack.com');
+    const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!target || !target.href) return;
 
-        const opensInNewTab = target.target === '_blank';
+    const href = target.href;
+    const parsed = zlackUrl(href);
+    const isExternal = zlackIsHttpUrl(parsed) && !zlackIsSlackUrl(parsed);
 
-        if (isExternal) {
-            e.preventDefault();
-            e.stopPropagation();
-            if (window.__TAURI__) {
-                window.__TAURI__.shell.open(href);
-            }
-        } else if (opensInNewTab) {
-            // Internal link meant for new tab -> force open in this window
-            e.preventDefault();
-            e.stopPropagation();
-            window.location.href = href;
-        }
+    if (isExternal) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (window.__TAURI__) window.__TAURI__.shell.open(parsed.href);
+        return;
+    }
+
+    if (target.target === '_blank') {
+        // Do not prevent default here. Just remove the new-tab behavior for this
+        // event turn and let Slack's own click handling do the in-app navigation.
+        zlackRetargetSlackAnchor(target);
     }
 }, true); // Capture phase to ensure we get it before Slack
 

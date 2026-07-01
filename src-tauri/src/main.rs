@@ -509,7 +509,11 @@ fn switch_to_workspace(app: &tauri::AppHandle, team: &str, url: Option<String>) 
     if let Some(url) = url {
         let js_url = format!("{:?}", url);
         let js = format!(
-            r#"if (window.location.href !== {0}) {{ window.location.href = {0}; }}"#,
+            r#"(function(url) {{
+                if (window.location.href === url) return;
+                if (window.__ZlackNavigateSlackUrl && window.__ZlackNavigateSlackUrl(url)) return;
+                window.location.href = url;
+            }})({0});"#,
             js_url
         );
         let _ = target.eval(&js);
